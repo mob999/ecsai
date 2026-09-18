@@ -13,11 +13,25 @@ from .settings import Settings
 
 def main():
     parser = argparse.ArgumentParser(prog="edge-sim")
-    parser.add_argument("command", choices=["validate", "run"])
+    parser.add_argument("command", choices=["validate", "run", "visualize"])
     parser.add_argument("scenario", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--commands", type=Path, help="Command log JSON for visualization")
     args = parser.parse_args()
+    if args.command == "visualize":
+        from .visualization import visualize_file
+
+        try:
+            target = visualize_file(
+                args.scenario, args.output or args.scenario.with_suffix(".html"), args.commands
+            )
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+        print(target.resolve())
+        return
+    if args.commands:
+        parser.error("--commands is only supported by visualize")
     scenario = ScenarioSpec.model_validate_json(args.scenario.read_text())
     if args.command == "validate":
         print("Scenario valid")

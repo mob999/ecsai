@@ -6,6 +6,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from edge_sim_models import CommandRecord, RunResult
+from pydantic import TypeAdapter
 
 
 def export_run(
@@ -14,6 +15,9 @@ def export_run(
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
     (target / "result.json").write_text(result.model_dump_json(indent=2))
+    (target / "commands.json").write_bytes(
+        TypeAdapter(tuple[CommandRecord, ...]).dump_json(commands, indent=2)
+    )
     if result.manifest is not None:
         (target / "manifest.json").write_text(result.manifest.model_dump_json(indent=2))
     metadata = {b"edge_sim.schema_version": b"1", b"edge_sim.kind": b"domain_events"}
