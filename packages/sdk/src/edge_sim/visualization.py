@@ -47,16 +47,18 @@ def export_html(
     payload = data.model_dump_json().replace("&", "\\u0026").replace("<", "\\u003c")
     payload = payload.replace(">", "\\u003e").replace("\u2028", "\\u2028")
     payload = payload.replace("\u2029", "\\u2029")
-    template = files("edge_sim").joinpath("templates/report.html").read_text(encoding="utf-8")
+    templates = files("edge_sim").joinpath("templates")
+    template = templates.joinpath("report.html").read_text(encoding="utf-8")
+    template = template.replace(
+        "__EDGE_SIM_STYLE__", templates.joinpath("report.css").read_text(encoding="utf-8")
+    ).replace("__EDGE_SIM_SCRIPT__", templates.joinpath("report.js").read_text(encoding="utf-8"))
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(template.replace("__EDGE_SIM_PAYLOAD__", payload), encoding="utf-8")
     return target
 
 
-def visualize_file(
-    source: Path, destination: Path, commands_path: Path | None = None
-) -> Path:
+def visualize_file(source: Path, destination: Path, commands_path: Path | None = None) -> Path:
     raw = json.loads(source.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Expected a scenario, run, result, or manifest JSON object")

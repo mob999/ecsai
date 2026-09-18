@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge Simulation · Report</title>
+<style>__EDGE_SIM_STYLE__</style>
+</head>
+<body>
+<header><div class="brand"><span class="mark">E</span> EDGE SIMULATION <span class="tag">EXPERIMENT REPORT</span></div><span class="offline">● Self-contained · Offline</span></header>
+<main>
+<div class="heading"><div><p class="eyebrow">INSPECT / UNDERSTAND / COMPARE</p><h1 id="title">Simulation report</h1><p id="subtitle" class="muted"></p></div><button id="download">Download source JSON ↓</button></div>
+<div id="summary" class="summary"></div>
+<nav aria-label="Report sections"><button class="tab active" data-tab="configuration" aria-pressed="true">Configuration</button><button class="tab" data-tab="trace" aria-pressed="false">Trace explorer</button></nav>
+<section id="configuration">
+<div class="section-heading"><h2>Infrastructure</h2><span class="muted">Directed routes · shared links express contention</span></div>
+<div class="panel"><div class="panel-head"><h3>Network topology</h3><span id="topology-note" class="muted"></span></div><div id="topology" class="graph"></div></div>
+<div class="grid"><div class="panel"><h3>Compute nodes</h3><div id="nodes"></div></div><div class="panel"><h3>Links & routes</h3><div id="links"></div><div id="routes"></div></div></div>
+<div class="section-heading"><h2>Workflows</h2><label>Workflow <select id="workflow"></select></label></div>
+<div class="panel"><div id="dag" class="graph"></div><div id="stages"></div><h3>Workflow artifacts</h3><div id="workflow-artifacts"></div></div>
+<div class="grid"><div class="panel"><h3>Global artifacts</h3><div id="artifacts"></div></div><div class="panel"><h3>Run settings</h3><div id="settings"></div></div></div>
+<div class="panel"><h3>Request arrivals</h3><div id="requests"></div></div>
+</section>
+<section id="trace" hidden>
+<div id="trace-notice" class="notice"></div>
+<div class="filters"><label>Request<select id="request-filter"><option value="">All requests</option></select></label><label>Node<select id="node-filter"><option value="">All nodes</option></select></label><label>Search<input id="search" type="search" placeholder="Entity, status, decision…"></label><button id="reset">Reset filters</button></div>
+<div class="section-heading"><h2>Stage timeline</h2><label>Zoom <input id="zoom" type="range" min="1" max="8" value="1" step="1"></label></div>
+<div class="panel"><div id="legend" class="legend"></div><p class="muted">Simulated seconds. Click a segment for details. Zero-duration states appear as ticks.</p><div id="timeline" class="timeline-scroll"></div></div>
+<div class="grid"><div class="panel"><h3>CPU utilization</h3><div id="cpu"></div></div><div class="panel"><h3>Link utilization</h3><div id="network"></div></div></div>
+<div class="panel"><h3>Final request snapshot</h3><div id="request-state"></div></div>
+<div class="panel"><h3>Final stage snapshot</h3><div id="stage-state"></div></div>
+<div class="panel"><h3>Data transfers</h3><p class="muted">Shared transfers are not attributed to a single request. Unmatched starts have an unknown end; cancellation is not recorded by the current engine.</p><div id="transfers"></div></div>
+<div class="panel"><div class="panel-head"><h3>Event log</h3><label>Event type<select id="event-filter"><option value="">All events</option></select></label></div><div id="events"></div></div>
+<div class="panel"><h3>Policy decisions</h3><div id="commands"></div></div>
+</section>
+<footer>Edge Simulation / CPU Cas01 · Network raw · Sizes are simulated bytes, not file payloads.</footer>
+</main>
+<dialog id="detail"><div class="panel-head"><h2 id="detail-title">Details</h2><button id="close-detail" aria-label="Close details">Close ×</button></div><pre id="detail-json"></pre></dialog>
+<script id="edge-sim-data" type="application/json">__EDGE_SIM_PAYLOAD__</script>
+<script>__EDGE_SIM_SCRIPT__</script>
+</body>
+</html>
