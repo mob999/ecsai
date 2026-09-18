@@ -8,5 +8,6 @@ build/
 *.egg-info/
 outputs/
 benchmark-results/
+benchmarks/*.json
 .DS_Store
 test_stackgrowth

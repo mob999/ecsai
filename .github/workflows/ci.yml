@@ -1,0 +1,26 @@
+name: checks
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          version: "0.9.5"
+      - name: Native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libboost-dev
+      - name: Bootstrap native SimGrid
+        run: |
+          uv venv --python 3.11 .venv
+          .venv/bin/python scripts/build_simgrid.py
+          .venv/bin/python -I -c 'import hashlib, pathlib, simgrid; print(hashlib.sha256(pathlib.Path(simgrid.__file__).read_bytes()).hexdigest())' > /tmp/simgrid-before-sync.sha256
+      - name: Sync workspace and verify native installation survives
+        run: |
+          uv sync --locked --all-packages
+          .venv/bin/python -I -c 'import hashlib, pathlib, simgrid; print(hashlib.sha256(pathlib.Path(simgrid.__file__).read_bytes()).hexdigest())' > /tmp/simgrid-after-sync.sha256
+          diff -u /tmp/simgrid-before-sync.sha256 /tmp/simgrid-after-sync.sha256
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked ruff check .
+      - run: uv run --locked pytest
