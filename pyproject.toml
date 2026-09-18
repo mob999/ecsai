@@ -6,6 +6,7 @@ dependencies = ["edge-sim"]
 
 [tool.uv]
 package = false
+build-constraint-dependencies = ["pybind11<3"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -28,4 +29,3 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["integration: executes real SimGrid in isolated processes"]
-
