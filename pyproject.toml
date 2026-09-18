@@ -1,0 +1,31 @@
+[project]
+name = "edge-ai-workspace"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = ["edge-sim"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+edge-sim = { workspace = true }
+edge-sim-models = { workspace = true }
+edge-sim-simgrid = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "ruff>=0.11,<1"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: executes real SimGrid in isolated processes"]
+
