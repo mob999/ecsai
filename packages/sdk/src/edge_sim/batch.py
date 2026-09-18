@@ -199,6 +199,18 @@ class BatchRunner:
             raise SDKError("not_finished", f"No terminal result captured for {run_id}")
         return self._results[run_id]
 
+    def cancel(self, run_id: str) -> None:
+        """Cancel an active or queued run; other runs continue using the released slot."""
+        self._check_open()
+        if run_id not in self._runs:
+            raise KeyError(run_id)
+        if run_id in self._results or run_id in self._errors:
+            return
+        if run_id in self._queue:
+            self._queue.remove(run_id)
+        self._record_error(run_id, SDKError("cancelled", f"Run cancelled: {run_id}"))
+        self._fill()
+
     def run(self) -> dict[str, RunResult]:
         """Drive all submitted built-in-policy runs to completion, draining the queue.
 

@@ -13,6 +13,7 @@ from edge_sim.session import SDKError, Session, start, validate
 from edge_sim_models import (
     AdvanceResult,
     NodeSpec,
+    Place,
     RequestSpec,
     RunResult,
     RunSpec,
@@ -214,6 +215,65 @@ def test_barrier_active_snapshot_and_queue_drain(protocol_backend):
         assert set(results) == {str(index) for index in range(5)}
         assert all(key == result.run_id for key, result in results.items())
         assert not batch.active_ids and not batch.pending_ids
+
+
+def test_cancel_reaps_active_worker_and_does_not_start_cancelled_queue(protocol_backend):
+    with BatchRunner(workers=1) as batch:
+        for name in ("hang", "cancel-queued", "survivor"):
+            batch.submit(_run(name))
+        child = batch.session("hang")
+        batch.submit_advance("hang")
+        batch.cancel("cancel-queued")
+        batch.cancel("hang")
+        assert child.closed
+        assert batch.active_ids == ("survivor",)
+        replies = batch.recv_ready(timeout=0)
+        assert set(replies) == {"hang", "cancel-queued"}
+        assert all(error.code == "cancelled" for error in replies.values())
+        assert batch.advance_all()["survivor"].kind == "finished"
+        assert batch.result("survivor").run_id == "survivor"
+        with pytest.raises(SDKError, match="cancelled"):
+            batch.result("hang")
+
+
+@pytest.mark.integration
+def test_concurrency_does_not_change_per_run_results():
+    scenario = ScenarioSpec(
+        nodes=_run().scenario.nodes,
+        workflows=(WorkflowSpec(id="job", stages=(StageSpec(id="work", flops=200),)),),
+        requests=(RequestSpec(id="r", workflow="job", receiver="edge"),),
+    )
+    results = []
+    for workers in (1, 2):
+        with BatchRunner(workers=workers) as batch:
+            for name in ("one", "two", "three"):
+                batch.submit(RunSpec(run_id=name, scenario=scenario, seed=37))
+            results.append(batch.run())
+    assert results[0] == results[1]
+
+
+@pytest.mark.integration
+def test_external_batch_decisions_are_independent_and_frozen():
+    scenario = ScenarioSpec(
+        nodes=_run().scenario.nodes,
+        workflows=(WorkflowSpec(id="job", stages=(StageSpec(id="work", flops=200),)),),
+        requests=(RequestSpec(id="r", workflow="job", receiver="edge"),),
+    )
+    with BatchRunner(workers=2) as batch:
+        for name in ("one", "two"):
+            batch.submit(RunSpec(run_id=name, scenario=scenario, external=True))
+        decisions = batch.advance_all()
+        assert {step.decision.run_id for step in decisions.values()} == {"one", "two"}
+        first = batch.session("one")
+        command = Place(request_id="r", stage_id="work", node_id="edge")
+        with pytest.raises(SDKError, match="stale_decision"):
+            first.apply(decisions["two"].decision.decision_id, (command,))
+        first.apply(decisions["one"].decision.decision_id, (command,))
+        running = first.advance()
+        assert running.kind == "decision"
+        assert batch.session("two").inspect().stages[0].status == "READY"
+        assert batch.session("two").inspect().now_s == 0
+        assert running.view.stages[0].status == "RUNNING"
 
 
 @pytest.mark.integration

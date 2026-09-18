@@ -1,6 +1,9 @@
 """Small analytical cases against the actual SimGrid engine, never a mock."""
 
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 from edge_sim import SDKError, start
@@ -12,6 +15,8 @@ from edge_sim_models import (
     LinkSpec,
     NodeSpec,
     Place,
+    PluginSpec,
+    PolicySpec,
     RequestSpec,
     Resume,
     RouteSpec,
@@ -54,6 +59,36 @@ def test_compute_and_exact_deadline():
     assert result.metrics.completed == 1
     assert result.metrics.cpu_utilization[0].value == pytest.approx(1)
     assert result.state.nodes[0].memory_used_bytes == 0
+
+
+def test_custom_placement_uses_command_validation_and_is_recorded():
+    policy = PolicySpec(
+        plugins=(PluginSpec(role="placement", factory="examples.policy_plugin:make_policy"),)
+    )
+    with start(RunSpec(scenario=compute_scenario(), policy=policy)) as session:
+        assert session.advance().kind == "finished"
+        result = session.result()
+        assert result.metrics.completed == 1
+        assert result.manifest.policy_plugins == policy.plugins
+        assert result.manifest.run_spec.policy == policy
+        assert isinstance(session.commands()[0].commands[0], Place)
+
+
+def test_cli_validates_runs_and_exports(tmp_path):
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(compute_scenario().model_dump_json())
+    output = tmp_path / "output"
+    executable = str(Path(sys.executable).with_name("edge-sim"))
+    for command in ("validate", "run"):
+        subprocess.run(
+            [executable, command, str(scenario), "--output", str(output)],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    result = RunResult.model_validate_json((output / "result.json").read_text())
+    assert result.metrics.completed == 1
+    assert (output / "events.parquet").is_file()
 
 
 def test_timeout_cleans_running_work_and_truncation_is_distinct():
@@ -227,13 +262,17 @@ def test_dag_data_moves_before_consumer_starts():
 def test_export_roundtrip_and_trace_disabled(tmp_path):
     import pyarrow.parquet as pq
 
-    result = finish(compute_scenario())
-    export_run(result, tmp_path)
+    with start(RunSpec(scenario=compute_scenario())) as session:
+        result = session.advance().result
+        export_run(result, tmp_path, session.commands())
     restored = RunResult.model_validate_json((tmp_path / "result.json").read_text())
     assert restored == result
     events = pq.read_table(tmp_path / "events.parquet")
     assert events.num_rows == len(result.events)
     assert events.schema.metadata[b"edge_sim.schema_version"] == b"1"
+    decisions = pq.read_table(tmp_path / "decisions.parquet")
+    assert decisions.num_rows == 1
+    assert decisions["view_json"][0].as_py() != "null"
     quiet = finish(compute_scenario(), trace=False)
     assert not quiet.events
     assert quiet.metrics.completed == 1

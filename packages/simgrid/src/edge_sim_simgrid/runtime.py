@@ -39,6 +39,7 @@ class Runtime:
         }
         self.transfers = {}
         self.comms = {}
+        self.transfer_timers = {}
         self.execs = {}
         self.routes = {(r.src, r.dst): r.links for r in self.scenario.routes}
         self.events = []
@@ -46,6 +47,7 @@ class Runtime:
         self.event_count = 0
         self.revision = 0
         self.pending = None
+        self.decision_dirty = False
         self.wake_s = None
         self.finished_reason = None
         self.round_robin = 0
@@ -53,6 +55,7 @@ class Runtime:
         self.link_bytes = Counter()
         self.cache_hits = 0
         self.transfer_count = 0
+        self.data_lookups = set()
         self.plugins = {}
         for plugin in run.policy.plugins:
             module, factory = plugin.factory.split(":")
@@ -136,13 +139,41 @@ class Runtime:
             return True
         if any(t.artifact_id == aid and t.src == node for t in self.transfers.values()):
             return True
+        alternatives = {n for a, n in self.replicas if a == aid and n != node}
+
+        def needed_at(dst):
+            return (node == dst or (node, dst) in self.routes) and not any(
+                n == dst or (n, dst) in self.routes for n in alternatives
+            )
+
         for key, stage in self.stages.items():
             if not self._active(stage.request_id):
                 continue
             if stage.status not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
                 if aid in self.inputs[key]:
-                    return True
-        return any(self._active(rid) and aid in self.outputs[rid] for rid in self.requests)
+                    if stage.node_id is not None:
+                        if stage.node_id == node or needed_at(stage.node_id):
+                            return True
+                    else:
+                        spec = self.stage_specs[key]
+                        needed = sum(
+                            self.artifacts[a].size_bytes
+                            for a in set(self.inputs[key] + self.outputs[key])
+                        )
+                        if any(
+                            n.id == node or needed_at(n.id)
+                            for n in self.nodes.values()
+                            if (not spec.eligible_nodes or n.id in spec.eligible_nodes)
+                            and spec.memory_bytes <= n.memory_bytes
+                            and needed <= n.storage_bytes
+                        ):
+                            return True
+        return any(
+            self._active(rid)
+            and aid in self.outputs[rid]
+            and (req.receiver == node or needed_at(req.receiver))
+            for rid, req in self.requests.items()
+        )
 
     def _reserve_data(self, aid, node):
         ledger = self.ledgers[node]
@@ -164,6 +195,9 @@ class Runtime:
         for replica in candidates:
             if ledger.storage_used + size <= ledger.storage_capacity:
                 break
+            # Earlier evictions may have made this the last reachable copy.
+            if self._pin(replica.artifact_id, node):
+                continue
             self._remove_replica(replica.artifact_id, node)
             self.emit("cache_evict", replica.artifact_id, node_id=node)
         return ledger.reserve_storage(aid, size)
@@ -173,6 +207,11 @@ class Runtime:
         self.ledgers[node].storage.pop(aid, None)
 
     def _ensure_data(self, aid, node, waiter):
+        lookup = (aid, node, waiter)
+        if lookup not in self.data_lookups:
+            self.data_lookups.add(lookup)
+            if (aid, node) in self.replicas:
+                self.cache_hits += 1
         if (aid, node) in self.replicas:
             self.replicas[aid, node].last_access = self.now
             return True
@@ -197,12 +236,37 @@ class Runtime:
             started_s=self.now,
             waiters={waiter},
         )
-        self.comms[key] = sg.Comm.sendto_async(
-            sg.Host.by_name(src), sg.Host.by_name(node), artifact.size_bytes
-        )
+        if artifact.size_bytes:
+            self.comms[key] = sg.Comm.sendto_async(
+                sg.Host.by_name(src), sg.Host.by_name(node), artifact.size_bytes
+            )
+        else:
+            # SimGrid raw zero-byte comms never complete. Only propagation remains;
+            # these timers consume no bandwidth and share normal transfer ownership.
+            links = {link.id: link for link in self.scenario.links}
+            self.transfer_timers[key] = self.now + sum(
+                links[link].latency_s for link in self.routes[src, node]
+            )
         self.transfer_count += 1
         self.emit("transfer_started", aid, src=src, dst=node, bytes=artifact.size_bytes)
+        if key in self.transfer_timers and self.transfer_timers[key] <= self.now:
+            self._complete_transfer(key)
+            return True
         return False
+
+    def _complete_transfer(self, key):
+        t = self.transfers.pop(key)
+        self.comms.pop(key, None)
+        self.transfer_timers.pop(key, None)
+        a = self.artifacts[t.artifact_id]
+        self.replicas[key] = ReplicaState(
+            artifact_id=t.artifact_id,
+            node_id=t.dst,
+            size_bytes=a.size_bytes,
+            cacheable=a.cacheable,
+            last_access=self.now,
+        )
+        self.emit("transfer_finished", t.artifact_id, src=t.src, dst=t.dst)
 
     def _finish_request(self, rid, status, reason=None):
         state = self.request_states[rid]
@@ -227,7 +291,10 @@ class Runtime:
                 w for w in transfer.waiters if w != rid and not w.startswith(rid + "/")
             }
             if not transfer.waiters:
-                self.comms.pop(key).cancel()
+                activity = self.comms.pop(key, None)
+                if activity is not None:
+                    activity.cancel()
+                self.transfer_timers.pop(key, None)
                 self.ledgers[transfer.dst].storage.pop(transfer.artifact_id, None)
                 del self.transfers[key]
         self.emit("request_finished", rid, status=status, reason=reason)
@@ -240,20 +307,14 @@ class Runtime:
 
     def _reap(self):
         changed = False
-        for key, activity in list(self.comms.items()):
-            if not activity.test():
+        for key in list(self.transfers):
+            if key in self.transfer_timers:
+                done = self.transfer_timers[key] <= self.now
+            else:
+                done = self.comms[key].test()
+            if not done:
                 continue
-            t = self.transfers.pop(key)
-            del self.comms[key]
-            a = self.artifacts[t.artifact_id]
-            self.replicas[key] = ReplicaState(
-                artifact_id=t.artifact_id,
-                node_id=t.dst,
-                size_bytes=a.size_bytes,
-                cacheable=a.cacheable,
-                last_access=self.now,
-            )
-            self.emit("transfer_finished", t.artifact_id, src=t.src, dst=t.dst)
+            self._complete_transfer(key)
             changed = True
         for key, activity in list(self.execs.items()):
             stage = self.stages[key]
@@ -299,7 +360,6 @@ class Runtime:
     def _place(self, key, node):
         stage = self.stages[key]
         stage.node_id = node
-        self.cache_hits += sum((a, node) in self.replicas for a in self.inputs[key])
         self._transition(stage, "WAITING_DATA")
 
     def _dispatch(self):
@@ -307,7 +367,11 @@ class Runtime:
         queued = [s for s in self.stages.values() if s.status == "QUEUED"]
         queued.sort(
             key=lambda s: (
-                (self.requests[s.request_id].deadline_s or math.inf)
+                (
+                    self.requests[s.request_id].deadline_s
+                    if self.requests[s.request_id].deadline_s is not None
+                    else math.inf
+                )
                 if self.run.policy.name == "edf"
                 else s.entered_s,
                 s.key,
@@ -350,6 +414,8 @@ class Runtime:
                     activity.host = sg.Host.by_name(node.id)
                     activity.start()
                     self.execs[key] = activity
+                    if spec.flops == 0:
+                        activity.wait()
                 stage.reason = None
                 self._transition(stage, "RUNNING")
                 busy[node.id] += 1
@@ -357,7 +423,14 @@ class Runtime:
         return changed
 
     def settle(self):
-        self._reap()
+        # Drain completions before expiring deadlines, but let simultaneous
+        # arrivals compete with queued work before making scheduling decisions.
+        while True:
+            changed = self._reap()
+            changed = self._deliver_completed() or changed
+            if not changed:
+                break
+        self._expire_deadlines()
         for rid, req in sorted(self.requests.items()):
             state = self.request_states[rid]
             if state.status == "PENDING" and req.arrival_s <= self.now:
@@ -366,10 +439,29 @@ class Runtime:
                     if stage.request_id == rid:
                         stage.entered_s = self.now
                 self.emit("request_arrived", rid)
+                if not self.workflows[req.workflow].stages:
+                    deliverables = set(self.outputs[rid])
+                    if sum(self.artifacts[a].size_bytes for a in deliverables) > self.nodes[
+                        req.receiver
+                    ].storage_bytes or any(
+                        not any(
+                            n == req.receiver or (n, req.receiver) in self.routes
+                            for n in self.artifacts[a].locations
+                        )
+                        for a in deliverables
+                    ):
+                        self._finish_request(rid, "REJECTED", "no_feasible_receiver")
+                        continue
                 if "admission" in self.plugins and not self.plugins["admission"].admit(
                     req, self.inspect()
                 ):
                     self._finish_request(rid, "REJECTED", "admission_policy")
+        self._settle_active()
+        if self._expire_deadlines():
+            self._settle_active()
+        self._collect_data()
+
+    def _settle_active(self):
         # Zero-work activities can complete without advancing time; drain to a fixed point.
         for _ in range(len(self.stages) + len(self.artifacts) + 2):
             changed = False
@@ -400,6 +492,7 @@ class Runtime:
                         )
                         self.round_robin += 1
                         changed = True
+            placements = [c for c in placements if self._active(c.request_id)]
             if placements:
                 self.pending = self._decision()
                 commands = tuple(placements)
@@ -426,23 +519,33 @@ class Runtime:
                 self.preemption_revision = self.revision
             changed = self._dispatch() or changed
             changed = self._reap() or changed
-            for rid, req in sorted(self.requests.items()):
-                if not self._active(rid):
-                    continue
-                stages = [s for s in self.stages.values() if s.request_id == rid]
-                if all(s.status == "SUCCEEDED" for s in stages):
-                    done = [self._ensure_data(a, req.receiver, rid) for a in self.outputs[rid]]
-                    if all(done):
-                        self._finish_request(rid, "SUCCEEDED")
-                        changed = True
+            changed = self._deliver_completed() or changed
             if not changed:
                 break
+
+    def _deliver_completed(self):
+        changed = False
+        for rid, req in sorted(self.requests.items()):
+            if not self._active(rid):
+                continue
+            stages = [s for s in self.stages.values() if s.request_id == rid]
+            if all(s.status == "SUCCEEDED" for s in stages):
+                done = [self._ensure_data(a, req.receiver, rid) for a in self.outputs[rid]]
+                if all(done):
+                    self._finish_request(rid, "SUCCEEDED")
+                    changed = True
+        return changed
+
+    def _expire_deadlines(self):
+        changed = False
         for rid, req in sorted(self.requests.items()):
             if self._active(rid) and req.deadline_s is not None and self.now >= req.deadline_s:
                 self._finish_request(rid, "TIMED_OUT", "deadline")
-        self._collect_data()
+                changed = True
+        return changed
 
     def _wait(self, date):
+        date = min(date, min(self.transfer_timers.values(), default=math.inf))
         active = list(self.comms.values()) + [
             a for key, a in self.execs.items() if self.stages[key].status == "RUNNING"
         ]
@@ -479,6 +582,7 @@ class Runtime:
             activity.cancel()
         self.execs.clear()
         self.comms.clear()
+        self.transfer_timers.clear()
 
     @staticmethod
     def _check_permutation(expected, actual):
@@ -589,7 +693,8 @@ class Runtime:
             return AdvanceResult(
                 kind="decision", time_s=self.now, view=self.inspect(), decision=self.pending
             )
-        changed_since_decision = False
+        changed_since_decision = self.decision_dirty
+        self.decision_dirty = False
         while True:
             revision = self.revision
             self.settle()
@@ -639,7 +744,7 @@ class Runtime:
             changed_since_decision |= self.now != previous
 
     def apply(self, decision_id, commands):
-        from edge_sim_models import Defer, Place, Reject, Resume, Suspend
+        from edge_sim_models import CommandRecord, Defer, Place, Reject, Resume, Suspend
 
         if self.pending is None or decision_id != self.pending.decision_id:
             raise CommandError("stale_decision", "Decision is missing, stale, or already consumed")
@@ -700,17 +805,18 @@ class Runtime:
             elif isinstance(command, Defer):
                 self.wake_s = command.until_s
         self.command_log.append(
-            {
-                "run_id": self.run.run_id,
-                "decision_id": decision_id,
-                "time_s": self.now,
-                "revision": self.pending.revision,
-                "commands": [c.model_dump(mode="json") for c in commands],
-                "view": self.pending.view.model_dump(mode="json"),
-                "policy_id": "external" if self.run.external else self.run.policy.name,
-            }
+            CommandRecord(
+                run_id=self.run.run_id,
+                decision_id=decision_id,
+                time_s=self.now,
+                revision=self.pending.revision,
+                commands=tuple(commands),
+                view=self.pending.view if self.run.trace else None,
+                policy_id="external" if self.run.external else self.run.policy.name,
+            )
         )
         self.pending = None
+        self.decision_dirty = True
         self.emit("decision_applied", decision_id)
 
     def result(self):
@@ -719,6 +825,7 @@ class Runtime:
         from edge_sim_models import Metric, RunManifest, RunMetrics, RunResult
 
         statuses = Counter(s.status for s in self.request_states.values())
+        view = self.inspect()
         metrics = RunMetrics(
             arrived=sum(s.status != "PENDING" for s in self.request_states.values()),
             completed=statuses["SUCCEEDED"],
@@ -751,20 +858,28 @@ class Runtime:
                 for rid, s in self.request_states.items()
                 if s.status == "SUCCEEDED"
             ),
+            stage_durations=tuple(
+                Metric(name=f"{s.request_id}/{s.stage_id}/{m.name}", value=m.value)
+                for s in view.stages
+                for m in s.durations
+            ),
         )
         manifest = RunManifest(
             run_id=self.run.run_id,
+            run_spec=self.run,
             seed=self.run.seed,
             scenario_hash=hashlib.sha256(self.scenario.model_dump_json().encode()).hexdigest(),
             python_version=platform.python_version(),
             simgrid_version="4.1",
             policy=self.run.policy.name,
+            policy_plugins=self.run.policy.plugins,
+            external_policy=self.run.external,
         )
         return RunResult(
             run_id=self.run.run_id,
             seed=self.run.seed,
             now_s=self.now,
-            state=self.inspect(),
+            state=view,
             events=tuple(self.events),
             completed=self.finished_reason == "completed",
             end_reason=self.finished_reason or "in_progress",

@@ -275,10 +275,12 @@ class ScenarioSpec(DTO):
 class PluginSpec(DTO):
     role: Literal["admission", "placement", "replica", "scheduling", "preemption", "cache"]
     factory: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z_][\w.]*:[a-zA-Z_]\w*$")]
+    version: Annotated[str, StringConstraints(min_length=1)] = "unspecified"
 
 
 class PolicySpec(DTO):
     name: PolicyName = "fifo"
+    version: Annotated[str, StringConstraints(min_length=1)] = "1"
     external: bool = False
     plugins: tuple[PluginSpec, ...] = ()
 
@@ -298,6 +300,12 @@ class RunSpec(DTO):
     external: bool = False
     pause_overhead_s: Seconds = 0
     resume_overhead_s: Seconds = 0
+
+    @model_validator(mode="after")
+    def unify_external_mode(self) -> Self:
+        if self.policy.external and not self.external:
+            object.__setattr__(self, "external", True)
+        return self
 
 
 class NodeState(DTO):
@@ -470,6 +478,10 @@ class RunManifest(DTO):
     policy: PolicyName = "fifo"
     cpu_model: Literal["Cas01"] = "Cas01"
     network_model: Literal["raw"] = "raw"
+    policy_plugins: tuple[PluginSpec, ...] = ()
+    view_schema: Literal["full-state-v1"] = "full-state-v1"
+    external_policy: bool = False
+    run_spec: RunSpec | None = None
     scenario_hash: str | None = None
     python_version: str = "unspecified"
     simgrid_version: str | None = None
@@ -516,6 +528,16 @@ class DecisionRequest(DTO):
         return self
 
 
+class CommandRecord(DTO):
+    run_id: RunId
+    decision_id: Identifier
+    revision: Count
+    time_s: Seconds
+    commands: tuple[DecisionCommand, ...]
+    view: StateView | None = None
+    policy_id: str
+
+
 class AdvanceResult(DTO):
     kind: Literal["decision", "time", "finished"]
     time_s: Seconds
@@ -545,6 +567,7 @@ __all__ = [
     "Bytes",
     "Candidate",
     "Count",
+    "CommandRecord",
     "DTO",
     "Decision",
     "DecisionCommand",

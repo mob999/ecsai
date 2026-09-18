@@ -32,7 +32,6 @@ def worker_main(connection, run_spec):
                         try:
                             if op == "close":
                                 runtime.close()
-                                connection.send(("ok", None))
                                 break
                             if op == "advance":
                                 value = runtime.advance(payload)
@@ -51,12 +50,15 @@ def worker_main(connection, run_spec):
                             connection.send(("ok", value))
                         except CommandError as error:
                             connection.send(("error", {"code": error.code, "message": str(error)}))
-                except EOFError:
+                except (EOFError, BrokenPipeError, ConnectionResetError):
                     runtime.close()
                 except Exception:
-                    connection.send(
-                        ("error", {"code": "backend_error", "message": traceback.format_exc()})
-                    )
+                    try:
+                        connection.send(
+                            ("error", {"code": "backend_error", "message": traceback.format_exc()})
+                        )
+                    except (EOFError, BrokenPipeError, ConnectionResetError):
+                        pass
                     runtime.close()
 
             simgrid.Actor.create(

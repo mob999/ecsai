@@ -94,6 +94,9 @@ Artifact pinning is also distinct from working memory: replicas that are needed
 by in-flight work cannot be treated as freely evictable cache entries. Storage
 pressure, cacheability, pinning, and transfer coalescing need explicit accounting.
 Do not interpret every available replica as independently evictable.
+Initial source replicas remain pinned. Other replicas preserve local active inputs
+and the last reachable source for future consumers; redundant remote copies can
+be reclaimed. Data has no disk I/O latency in V1.
 
 The worker configures SimGrid `network/model:raw` and `cpu/model:Cas01`. Raw network
 timings are model-specific and should not be presented as a calibrated TCP or
@@ -101,6 +104,16 @@ packet-level prediction. Routes are directed; shared link IDs express contention
 Explicit reverse routes are needed for reverse traffic. Route completeness,
 replica reachability, storage capacity, and placement feasibility remain relevant
 even for a structurally valid DAG.
+
+There is one narrow backend workaround: SimGrid 4.1 raw `sendto_async` activities
+with zero bytes can remain incomplete indefinitely. For these transfers only,
+the runtime tracks a simulated-time timer equal to the sum of the directed
+route's link latencies. A zero-latency delivery completes at the current time;
+positive latency participates in the controller's normal SimGrid wait/sleep
+boundaries. These transfers consume no bandwidth, but retain normal replica
+pinning, waiter coalescing, cancellation, and transfer events. Completion at a
+deadline wins the tie. Positive-byte transfers and computational progress remain
+owned by SimGrid; no byte-progress estimator or replacement network model is used.
 
 ## Isolation, reset, and limitations
 
@@ -110,6 +123,11 @@ a new run, paying startup costs again. There is no in-process reset, checkpoint,
 resume-from-snapshot, or process migration contract. A seed is part of the run
 record; it does not promise identical wall timings or cross-version numerical
 identity.
+
+Exported manifests retain the complete validated `RunSpec`, including overheads,
+termination conditions, seeds, and policy version labels. Plugin versions are
+caller-supplied metadata, not automatic source fingerprints. Archive plugin code
+with experiment results when reproducibility across checkouts matters.
 
 RPCs are synchronous and a session permits one outstanding operation. Transport
 timeouts and dead workers become SDK errors; failed operations are not silently

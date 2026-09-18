@@ -24,7 +24,8 @@ policy = PolicySpec(
 Pass this policy to `RunSpec`. Each spawned worker imports the module, calls the
 factory once, and keeps the returned object for that run. The factory must be
 accessible by its module and attribute name in the worker environment. Current
-`PluginSpec` fields are `role` and `factory`; there is no factory-kwargs or
+`PluginSpec` fields are `role`, `factory`, and an explicit `version` label
+(default `unspecified`); there is no factory-kwargs or
 configuration-payload field. A factory can construct its own Pydantic settings.
 
 Factory strings are trusted code configuration, not sandboxed scenario data:
@@ -60,3 +61,10 @@ uv run python -m examples.policy_plugin
 ```
 
 This demonstrates the extension boundary, not an optimized placement strategy.
+
+Built-in policies are deterministic. Randomized external policies should construct
+their own RNG from `edge_sim.policies.derive_seed(run.seed, run.run_id, stream)`;
+include a scenario identifier in `stream` when needed. This uses SHA-256, not
+Python's process-randomized hash. A custom plugin owns its random state and must
+record its seed/configuration and version; the SDK does not seed arbitrary
+third-party global RNGs automatically.

@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from edge_sim_models import RunResult
+from edge_sim_models import CommandRecord, RunResult
 
 
-def export_run(result: RunResult, directory: str | Path, commands=()) -> Path:
+def export_run(
+    result: RunResult, directory: str | Path, commands: tuple[CommandRecord, ...] = ()
+) -> Path:
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
     (target / "result.json").write_text(result.model_dump_json(indent=2))
@@ -60,7 +62,8 @@ def export_run(result: RunResult, directory: str | Path, commands=()) -> Path:
             "view_json": json.dumps(row.get("view"), sort_keys=True),
             "policy_id": row.get("policy_id", "external"),
         }
-        for row in commands
+        for record in commands
+        for row in (record.model_dump(mode="json"),)
     ]
     pq.write_table(
         pa.Table.from_pylist(command_rows, schema=command_schema), target / "decisions.parquet"
