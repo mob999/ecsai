@@ -44,3 +44,31 @@ invocation verified that a nonempty `--allow-regression` explanation preserves
 the flag while returning success. This was an override-path check, not a finding
 that the RSS change is acceptable; its cause remains uninvestigated. The original
 full baseline measurements were preserved.
+
+## Final implementation rerun
+
+After correctness fixes and full `RunSpec` manifests, a rerun identified an
+unnecessary second result RPC in `BatchRunner`: terminal `AdvanceResult` already
+contains that result. The runner now caches this same immutable object before
+releasing its worker, avoiding duplicate serialization and retained result copies.
+A transport regression test verifies the result object is reused.
+
+The final comparison report is `benchmark-results/final-deduplicated.json`:
+24 cells, 90/90 runs, 7,110 completions, 15.430 s summed cell wall time,
+11.237 s summed startup, and 3.650 s summed advance barriers. No cell exceeds
+the 15% throughput-decline threshold (worst change: -14.08%). Peak sampled
+parent-plus-worker RSS was 538,312,704 bytes.
+
+Seven cells still exceed the 20% RSS-growth threshold, so the comparison command
+correctly exits nonzero; no override was applied. The largest relative change,
+128-node mixed/one-worker, is +35.22%: sampled parent peak grew from 67,485,696
+to 108,363,776 bytes, while worker peak grew from 53,198,848 to 54,820,864 bytes.
+Thus the observed increase is primarily in the parent, not per-engine native
+memory. Full manifests and richer retained Pydantic results expand the parent's
+allocation workload; Python allocator retention across matrix cells is a plausible
+additional contributor, not a verified leak diagnosis. Isolated-cell repetitions
+and allocation profiling are required to attribute the remaining increase.
+
+This is a functional V1 baseline, not a claim that all performance gates passed.
+The earlier baseline and both before/after optimization reports remain available
+locally. Do not replace the baseline simply to silence these memory warnings.

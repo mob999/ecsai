@@ -45,7 +45,6 @@ class BatchRunner:
         self._queue: deque[str] = deque()
         self._active: dict[str, Session] = {}
         self._requested: dict[str, float | None] = {}
-        self._finishing: dict[str, AdvanceResult] = {}
         self._results: dict[str, RunResult] = {}
         self._errors: dict[str, SDKError] = {}
         self._ready: dict[str, AdvanceResult | SDKError] = {}
@@ -76,7 +75,6 @@ class BatchRunner:
         self._errors[run_id] = error
         self._ready[run_id] = error
         self._requested.pop(run_id, None)
-        self._finishing.pop(run_id, None)
         session = self._active.pop(run_id, None)
         if session is not None:
             session.close()
@@ -152,15 +150,12 @@ class BatchRunner:
                     continue
                 try:
                     response = session._receive()
-                    if run_id in self._finishing:
-                        self._results[run_id] = response
-                        self._ready[run_id] = self._finishing.pop(run_id)
+                    if response.kind == "finished":
+                        self._results[run_id] = response.result
+                        self._ready[run_id] = response
                         self._requested.pop(run_id)
                         session.close()
                         del self._active[run_id]
-                    elif response.kind == "finished":
-                        self._finishing[run_id] = response
-                        session._send("result")
                     else:
                         self._ready[run_id] = response
                         self._requested.pop(run_id)
@@ -238,7 +233,6 @@ class BatchRunner:
             self._active.clear()
             self._queue.clear()
             self._requested.clear()
-            self._finishing.clear()
 
     def __enter__(self) -> BatchRunner:
         return self

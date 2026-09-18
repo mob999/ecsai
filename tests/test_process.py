@@ -51,7 +51,7 @@ def _protocol_worker(connection, run):
                 value = AdvanceResult(kind="finished", time_s=0, view=view, result=result)
             elif op == "result":
                 if run.run_id == "capture":
-                    time.sleep(0.3)
+                    raise AssertionError("Terminal advance already contains the complete result")
                 value = RunResult(run_id=run.run_id)
             elif op == "apply":
                 mutations += 1
@@ -177,14 +177,12 @@ def test_result_captured_before_queued_worker_starts(protocol_backend):
         assert batch.pending_ids == ("next",)
         batch.submit_advance("capture")
         batch.submit_advance("next")
-        assert batch.recv_ready(timeout=0.05) == {}
-        assert batch.active_ids == ("capture",)
-        assert batch.pending_ids == ("next",)
         with pytest.raises(SDKError, match="not_finished"):
             batch.result("capture")
         replies = batch.recv_ready(timeout=5)
         assert replies["capture"].kind == "finished"
         assert batch.result("capture").run_id == "capture"
+        assert batch.result("capture") is replies["capture"].result
         assert batch.active_ids == ("next",)
         assert batch.recv_ready(timeout=5)["next"].kind == "finished"
         assert not batch.active_ids
