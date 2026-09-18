@@ -214,6 +214,9 @@ class RequestSpec(DTO):
 
 
 class ScenarioSpec(DTO):
+    schema_version: Literal["1"] = "1"
+    cpu_model: Literal["Cas01"] = "Cas01"
+    network_model: Literal["raw"] = "raw"
     nodes: tuple[NodeSpec, ...]
     links: tuple[LinkSpec, ...] = ()
     routes: tuple[RouteSpec, ...] = ()
@@ -269,9 +272,20 @@ class ScenarioSpec(DTO):
         return self
 
 
+class PluginSpec(DTO):
+    role: Literal["admission", "placement", "replica", "scheduling", "preemption", "cache"]
+    factory: Annotated[str, StringConstraints(pattern=r"^[a-zA-Z_][\w.]*:[a-zA-Z_]\w*$")]
+
+
 class PolicySpec(DTO):
     name: PolicyName = "fifo"
     external: bool = False
+    plugins: tuple[PluginSpec, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_plugins(self) -> Self:
+        _unique(tuple(p.role for p in self.plugins), "policy plugin roles")
+        return self
 
 
 class RunSpec(DTO):
@@ -309,6 +323,8 @@ class StageState(DTO):
     remaining_flops: Flops = 0
     started_s: Seconds | None = None
     completed_s: Seconds | None = None
+    reason: str | None = None
+    durations: tuple[Metric, ...] = ()
 
     @model_validator(mode="after")
     def validate_times(self) -> Self:
@@ -452,6 +468,8 @@ class RunManifest(DTO):
     run_id: RunId
     seed: Count = 0
     policy: PolicyName = "fifo"
+    cpu_model: Literal["Cas01"] = "Cas01"
+    network_model: Literal["raw"] = "raw"
     scenario_hash: str | None = None
     python_version: str = "unspecified"
     simgrid_version: str | None = None
@@ -548,6 +566,7 @@ __all__ = [
     "NonNegativeFloat",
     "Place",
     "PolicyName",
+    "PluginSpec",
     "PolicySpec",
     "PositiveFloat",
     "Reject",

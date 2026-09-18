@@ -9,3 +9,4 @@ build/
 outputs/
 benchmark-results/
 .DS_Store
+test_stackgrowth
