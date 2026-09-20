@@ -165,7 +165,8 @@ def main():
             args.wandb_mode,
             [{"env_steps": 0, **{"test/" + k: v for k, v in result["mean"].items()}}],
         )
-    for label in ("Scratch", "BC-full", "BC-head"):
+    # Exercise the requested pretrained-to-online path first, then matched controls.
+    for label in ("BC-full", "Scratch", "BC-head"):
         folder = root / label
         checkpoint = folder / "last.pt"
         complete = (
