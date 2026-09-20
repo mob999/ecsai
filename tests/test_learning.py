@@ -399,3 +399,22 @@ def test_configurable_backbone_and_initial_exploration():
     assert loc.shape == (8, ACTION)
     (loc.sum() + scale.sum()).backward()
     assert actor.gru.weight_ih_l0.grad.abs().sum() > 0
+
+
+def test_positive_reward_scaling_preserves_business_metrics():
+    cfg = ScenarioConfig.profile("smoke")
+    results = []
+    for scale in (1.0, 0.1):
+        env = SchedulingEnv(cfg.model_copy(update={"reward_scale": scale}))
+        try:
+            env.reset(seed=42)
+            actions = {a: np.array([0, 0, 0, -5, 0.6], np.float32) for a in env.agents}
+            rewards = []
+            while env.agents:
+                _, reward, _, _, _ = env.step(actions)
+                rewards.append(next(iter(reward.values())))
+            results.append((np.array(rewards), env.drain()))
+        finally:
+            env.close()
+    np.testing.assert_allclose(results[0][0] * 0.1, results[1][0])
+    assert results[0][1] == results[1][1]

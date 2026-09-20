@@ -85,3 +85,5 @@ W&B 项目 `ecsai-deppo`，entity 使用 `WANDB_ENTITY`，明确选择 offline/o
 可用 `--normalize-advantage` 开启逐 agent 优势归一化；`--initial-std .3` 缩小初始高斯探索标准差；`--hidden-size 256 --context-size 128` 扩大 actor/critic MLP 与 GRU。默认值不变，避免影响旧实验。所有选项写入配置和 checkpoint，续训必须保持一致。先在同场景/奖励/种子下比较优化器与探索配置，再单独比较网络容量，不能通过改负载把曲线变好。
 
 确定性部署与随机策略诊断分别评估：`evaluate --exploration stochastic` 按固定评估种子采样模型动作，同时保护调用者的 PyTorch RNG 状态。默认仍是 deterministic；两个口径分别写入 evaluation.json，不能把随机策略诊断冒充默认验证成绩。参数化动作经过转发硬阈值，均值动作的收益不一定等于随机策略的期望收益。
+
+奖励尺度对照使用 `configs/learning/small-reward-scaled.json`：`reward_scale=.1` 仅对返回给学习器的奖励乘正常数，不改变物理场景或业务目标。`train/business_reward`、`train/paper_reward` 保持未缩放，评估增加 `unscaled_episode_return`；跨尺度比较只能使用这些未缩放指标及成功率，不能把数值接近零解释为性能改善。此对照检验 critic 价值尺度，不预设它有效。

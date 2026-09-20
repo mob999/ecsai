@@ -128,6 +128,7 @@ def evaluate(
                     "seed": seed,
                     "workload": env.workload,
                     "episode_return": env.episode_return,
+                    "unscaled_episode_return": env.episode_return / config.reward_scale,
                     "unfinished_at_truncation": truncated_metrics["unfinished"],
                     "wall_s": perf_counter() - started,
                     "inference_wall_s": inference_s,
@@ -448,7 +449,10 @@ def train(
             raise ValueError("checkpoint training options mismatch")
         if payload.get("action_dim") != ACTION:
             raise ValueError("checkpoint action dimension mismatch: v2 requires five actions")
-        if payload["scenario"] != scenario.model_dump() or payload["method"] != method:
+        if (
+            type(scenario).model_validate(payload["scenario"]) != scenario
+            or payload["method"] != method
+        ):
             raise ValueError("checkpoint scenario/method mismatch")
         if payload.get("workers", workers) != workers or payload["seed"] != seed:
             raise ValueError("resume requires the original worker count and training seed")

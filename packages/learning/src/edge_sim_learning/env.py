@@ -223,6 +223,7 @@ class SchedulingEnv(ParallelEnv):
             - 0.1 * sum(response.view.latencies_s) / self.config.deadline_s
         ) / max(1, self.config.request_rate * self.config.period_s)
         reward = paper_reward if self.config.reward_mode == "paper" else business_reward
+        reward *= self.config.reward_scale
         self.episode_return += reward
         done = self.cycle >= self.config.cycles
         self.last_metrics = self.metrics() | {

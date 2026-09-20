@@ -27,6 +27,7 @@ class ScenarioConfig(BaseModel):
     topology_seed: int = 1729
     coalesce_backhaul: bool = False
     reward_mode: Literal["business", "paper"] = "business"
+    reward_scale: float = Field(default=1.0, gt=0)
     clusters: int = Field(default=3, ge=2)
     caches: int = Field(default=10, ge=2)
     request_rate: float = Field(default=300, gt=0)
