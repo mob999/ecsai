@@ -121,9 +121,28 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
         minibatch=8,
         eval_interval=16,
         eval_episodes=1,
+        eval_stochastic=True,
     )
     train(output=tmp_path / "first", **common)
     payload = torch.load(tmp_path / "first" / "last.pt", weights_only=False)
+    import json
+
+    deterministic = json.loads((tmp_path / "first/evaluation-16.json").read_text())
+    sampled = json.loads((tmp_path / "first/evaluation-stochastic-16.json").read_text())
+    assert sampled["exploration"] == "stochastic"
+    assert deterministic["seeds"] == sampled["seeds"]
+    assert deterministic["episodes"][0]["workload"] == sampled["episodes"][0]["workload"]
+    from edge_sim_learning.experiment import evaluate
+
+    rng_before = torch.get_rng_state().clone()
+    repeated = evaluate(
+        cfg, "DEPPO-adapted", payload["policy"], sampled["seeds"], exploration="stochastic"
+    )
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert repeated["mean"]["success_rate"] == sampled["mean"]["success_rate"]
+    assert repeated["mean"]["episode_return"] == sampled["mean"]["episode_return"]
+    best = torch.load(tmp_path / "first/best.pt", weights_only=False)
+    assert best["best"][0] == deterministic["mean"]["success_rate"]
     actor = next(m for m in payload["policy"].modules() if isinstance(m, ContextModel))
     assert len(actor.actors) == 2
     from tensordict import TensorDict

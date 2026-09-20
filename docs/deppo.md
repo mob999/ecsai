@@ -87,3 +87,19 @@ W&B 项目 `ecsai-deppo`，entity 使用 `WANDB_ENTITY`，明确选择 offline/o
 确定性部署与随机策略诊断分别评估：`evaluate --exploration stochastic` 按固定评估种子采样模型动作，同时保护调用者的 PyTorch RNG 状态。默认仍是 deterministic；两个口径分别写入 evaluation.json，不能把随机策略诊断冒充默认验证成绩。参数化动作经过转发硬阈值，均值动作的收益不一定等于随机策略的期望收益。
 
 奖励尺度对照使用 `configs/learning/small-reward-scaled.json`：`reward_scale=.1` 仅对返回给学习器的奖励乘正常数，不改变物理场景或业务目标。`train/business_reward`、`train/paper_reward` 保持未缩放，评估增加 `unscaled_episode_return`；跨尺度比较只能使用这些未缩放指标及成功率，不能把数值接近零解释为性能改善。此对照检验 critic 价值尺度，不预设它有效。
+
+### Sampled-policy validation diagnostics
+
+`train --eval-stochastic` additionally evaluates the sampled policy on exactly the
+same fixed validation request seeds at each evaluation boundary. W&B/CSV uses
+`eval_stochastic/*`, and per-episode results are saved separately as
+`evaluation-stochastic-<env_steps>.json`. Existing `eval/*` curves and `best.pt`
+selection remain deterministic. The option may be enabled when resuming an old
+five-action checkpoint; it does not alter the optimizer or training configuration.
+Evaluation preserves the training Torch RNG, and the sampled evaluation repeats
+with a fixed policy RNG seed per request workload.
+
+This distinction matters for DEPPO: taking the policy's deterministic continuous
+parameters and then thresholding the forwarding score can behave very differently
+from sampling parameters as during PPO collection. Compare both curves explicitly;
+a good sampled score does not establish deterministic deployment performance.

@@ -32,6 +32,10 @@ def main():
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--eval-interval", type=int, default=8192)
     p.add_argument("--eval-episodes", type=int, default=10)
+    p.add_argument(
+        "--eval-stochastic", action="store_true",
+        help="Also log sampled-policy validation; best checkpoint still uses deterministic scores",
+    )
     p.add_argument("--resume", type=Path)
     p = sub.choices["evaluate"]
     p.add_argument(
@@ -79,6 +83,7 @@ def main():
             hidden_size=args.hidden_size,
             context_size=args.context_size,
             initial_std=args.initial_std,
+            eval_stochastic=args.eval_stochastic,
         )
     elif args.command == "evaluate":
         from .experiment import evaluate, save_report

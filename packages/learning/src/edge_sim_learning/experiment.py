@@ -206,11 +206,15 @@ class InferenceTimer:
 
 
 class RunLog(Callback):
-    def __init__(self, output, scenario, method, seed, mode, eval_interval, eval_episodes):
+    def __init__(
+        self, output, scenario, method, seed, mode, eval_interval, eval_episodes,
+        eval_stochastic=False,
+    ):
         super().__init__()
         self.output = str(output)
         self.scenario, self.method, self.seed = scenario, method, seed
         self.mode, self.eval_interval, self.eval_episodes = mode, eval_interval, eval_episodes
+        self.eval_stochastic = eval_stochastic
         self.best = (-1.0, float("-inf"))
 
     def on_setup(self):
@@ -356,6 +360,18 @@ class RunLog(Callback):
             if score > self.best:
                 self.best = score
                 self.checkpoint("best.pt")
+            if self.eval_stochastic:
+                sampled = evaluate(
+                    self.scenario,
+                    self.method,
+                    exp.policy,
+                    result["seeds"],
+                    exploration="stochastic",
+                )
+                self.emit({"eval_stochastic/" + k: v for k, v in sampled["mean"].items()})
+                (Path(self.output) / f"evaluation-stochastic-{exp.total_frames}.json").write_text(
+                    json.dumps(sampled, indent=2)
+                )
         self.checkpoint("last.pt")
         self.collection_started = perf_counter()
 
@@ -380,6 +396,7 @@ def train(
     hidden_size=128,
     context_size=64,
     initial_std=None,
+    eval_stochastic=False,
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -423,7 +440,9 @@ def train(
         layer_class=torch.nn.Linear,
         activation_class=torch.nn.ReLU,
     )
-    callback = RunLog(output, scenario, method, seed, mode, eval_interval, eval_episodes)
+    callback = RunLog(
+        output, scenario, method, seed, mode, eval_interval, eval_episodes, eval_stochastic
+    )
     training_options = dict(
         normalize_advantage=normalize_advantage,
         hidden_size=hidden_size,
@@ -439,6 +458,7 @@ def train(
         "workers": workers,
         "eval_interval": eval_interval,
         "eval_episodes": eval_episodes,
+        "eval_stochastic": eval_stochastic,
         "wandb_mode": mode,
     }
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str))
