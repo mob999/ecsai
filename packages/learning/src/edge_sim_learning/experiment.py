@@ -280,6 +280,7 @@ class RunLog(Callback):
         state = exp.state_dict()
         state["state"]["n_iters_performed"] = exp.n_iters_performed + int(advance_iteration)
         payload = {
+            "training_options": self.training_options,
             "action_dim": ACTION,
             "format_version": 2,
             "experiment": state,
@@ -353,6 +354,10 @@ def train(
     eval_episodes=10,
     resume=None,
     learning_rate=1e-4,
+    normalize_advantage=False,
+    hidden_size=128,
+    context_size=64,
+    initial_std=None,
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -392,10 +397,20 @@ def train(
     algorithm.lmbda, algorithm.clip_epsilon, algorithm.share_param_critic = 0.95, 0.1, True
     algorithm.entropy_coef = 0.001
     critic = MlpConfig(
-        num_cells=[128, 128], layer_class=torch.nn.Linear, activation_class=torch.nn.ReLU
+        num_cells=[hidden_size, hidden_size],
+        layer_class=torch.nn.Linear,
+        activation_class=torch.nn.ReLU,
     )
     callback = RunLog(output, scenario, method, seed, mode, eval_interval, eval_episodes)
+    training_options = dict(
+        normalize_advantage=normalize_advantage,
+        hidden_size=hidden_size,
+        context_size=context_size,
+        initial_std=initial_std,
+    )
+    callback.training_options = training_options
     config = metadata(scenario, seed, method) | {
+        "training_options": training_options,
         "experiment": cfg.__dict__,
         "algorithm": algorithm.__dict__,
         "episodes": episodes,
@@ -407,6 +422,9 @@ def train(
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str))
     payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
     if payload:
+        legacy = dict(normalize_advantage=False, hidden_size=128, context_size=64, initial_std=None)
+        if payload.get("training_options", legacy) != training_options:
+            raise ValueError("checkpoint training options mismatch")
         if payload.get("action_dim") != ACTION:
             raise ValueError("checkpoint action dimension mismatch: v2 requires five actions")
         if payload["scenario"] != scenario.model_dump() or payload["method"] != method:
@@ -423,12 +441,20 @@ def train(
     experiment = StableExperiment(
         task=ContentTask(scenario, episode_start),
         algorithm_config=algorithm,
-        model_config=ContextConfig(use_context=method == "DEPPO-adapted"),
+        model_config=ContextConfig(
+            use_context=method == "DEPPO-adapted",
+            hidden_size=hidden_size,
+            context_size=context_size,
+            initial_std=initial_std,
+        ),
         critic_model_config=critic,
         seed=seed,
         config=cfg,
         callbacks=[callback],
     )
+    for loss in experiment.losses.values():
+        loss.normalize_advantage = normalize_advantage
+        loss.normalize_advantage_exclude_dims = (-2,)
     try:
         if resume:
             experiment.load_state_dict(payload["experiment"])

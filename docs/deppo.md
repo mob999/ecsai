@@ -79,3 +79,7 @@ W&B 项目 `ecsai-deppo`，entity 使用 `WANDB_ENTITY`，明确选择 offline/o
 | 对照 | RD/FO/DO/SAC/DD | RD/FO/DO、固定比例调优、自适应启发式、无历史MAPPO；不冒充DD/SAC |
 
 本阶段不改变转发目标/本地调度目标算法，不实现监督预训练。
+
+## 性能调优对照
+
+可用 `--normalize-advantage` 开启逐 agent 优势归一化；`--initial-std .3` 缩小初始高斯探索标准差；`--hidden-size 256 --context-size 128` 扩大 actor/critic MLP 与 GRU。默认值不变，避免影响旧实验。所有选项写入配置和 checkpoint，续训必须保持一致。先在同场景/奖励/种子下比较优化器与探索配置，再单独比较网络容量，不能通过改负载把曲线变好。

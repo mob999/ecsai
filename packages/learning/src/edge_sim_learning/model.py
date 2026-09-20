@@ -1,5 +1,6 @@
 """Explicit history windows make shuffled PPO recomputation reproducible."""
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -10,18 +11,34 @@ from .env import ACTION, HISTORY, OBS
 
 
 class HistoryActor(nn.Module):
-    def __init__(self, output_dim=2 * ACTION, use_context=True):
+    def __init__(
+        self,
+        output_dim=2 * ACTION,
+        use_context=True,
+        hidden_size=128,
+        context_size=64,
+        initial_std=None,
+    ):
         super().__init__()
         self.use_context = use_context
         if use_context:
-            self.gru = nn.GRU(OBS + ACTION, 64, batch_first=True)
+            self.gru = nn.GRU(OBS + ACTION, context_size, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(OBS + (64 if use_context else 0), 128),
+            nn.Linear(OBS + (context_size if use_context else 0), hidden_size),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(128, output_dim),
+            nn.Linear(hidden_size, output_dim),
         )
+
+        if initial_std is not None:
+            if not 0.1 <= initial_std <= 1.5:
+                raise ValueError("initial_std must be in [0.1, 1.5]")
+            # Invert BenchMARL biased_softplus_1.0 (floor .01); loc init is unchanged.
+            raw = math.log(math.expm1(initial_std - 0.01)) - math.log(math.expm1(0.99))
+            with torch.no_grad():
+                self.mlp[-1].weight[output_dim // 2 :].zero_()
+                self.mlp[-1].bias[output_dim // 2 :].fill_(raw)
 
     def forward(self, features):
         current = features[..., :OBS]
@@ -33,7 +50,9 @@ class HistoryActor(nn.Module):
                 torch.arange(len(length), device=length.device), (length - 1).clamp_min(0)
             ]
             context = context * (length > 0).unsqueeze(-1)
-            current = torch.cat((current, context.reshape(*features.shape[:-1], 64)), -1)
+            current = torch.cat(
+                (current, context.reshape(*features.shape[:-1], self.gru.hidden_size)), -1
+            )
         raw = self.mlp(current)
         loc, raw_scale = raw.chunk(2, dim=-1)
         # BenchMARL applies biased_softplus_1.0 to the second half.
@@ -42,13 +61,21 @@ class HistoryActor(nn.Module):
 
 
 class ContextModel(Model):
-    def __init__(self, use_context=True, **kwargs):
+    def __init__(
+        self, use_context=True, hidden_size=128, context_size=64, initial_std=None, **kwargs
+    ):
         super().__init__(**kwargs)
         if self.centralised or self.share_params or not self.input_has_agent_dim:
             raise ValueError("DEPPO actor requires independent local agent parameters")
         self.actors = nn.ModuleList(
             [
-                HistoryActor(self.output_leaf_spec.shape[-1], use_context)
+                HistoryActor(
+                    self.output_leaf_spec.shape[-1],
+                    use_context,
+                    hidden_size,
+                    context_size,
+                    initial_std,
+                )
                 for _ in range(self.n_agents)
             ]
         ).to(self.device)
@@ -64,6 +91,9 @@ class ContextModel(Model):
 @dataclass
 class ContextConfig(ModelConfig):
     use_context: bool = True
+    hidden_size: int = 128
+    context_size: int = 64
+    initial_std: float | None = None
 
     @staticmethod
     def associated_class():

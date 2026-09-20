@@ -25,6 +25,10 @@ def main():
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--minibatch", type=int, default=512)
     p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--normalize-advantage", action="store_true")
+    p.add_argument("--hidden-size", type=int, default=128)
+    p.add_argument("--context-size", type=int, default=64)
+    p.add_argument("--initial-std", type=float)
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--eval-interval", type=int, default=8192)
     p.add_argument("--eval-episodes", type=int, default=10)
@@ -68,6 +72,10 @@ def main():
             args.eval_episodes,
             args.resume,
             args.learning_rate,
+            normalize_advantage=args.normalize_advantage,
+            hidden_size=args.hidden_size,
+            context_size=args.context_size,
+            initial_std=args.initial_std,
         )
     elif args.command == "evaluate":
         from .experiment import evaluate, save_report

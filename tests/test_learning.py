@@ -384,3 +384,18 @@ def test_kl_stop_and_nonfinite_update_preserves_checkpoint(tmp_path, monkeypatch
     assert payload["experiment"]["state"]["total_frames"] == 0
     assert all(torch.isfinite(p).all() for p in payload["policy"].parameters())
     assert (tmp_path / "bad/failure.json").exists()
+
+
+def test_configurable_backbone_and_initial_exploration():
+    from tensordict.nn import NormalParamExtractor
+
+    actor = HistoryActor(hidden_size=256, context_size=128, initial_std=0.3)
+    features = torch.randn(8, FEATURES)
+    features[:, -1] = 4
+    loc, scale = NormalParamExtractor(scale_mapping="biased_softplus_1.0")(actor(features))
+    assert actor.gru.hidden_size == 128
+    assert actor.mlp[0].out_features == 256
+    assert torch.allclose(scale, torch.full_like(scale, 0.3), atol=1e-6)
+    assert loc.shape == (8, ACTION)
+    (loc.sum() + scale.sum()).backward()
+    assert actor.gru.weight_ih_l0.grad.abs().sum() > 0
