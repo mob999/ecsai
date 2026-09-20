@@ -10,7 +10,7 @@ from .env import ACTION, HISTORY, OBS
 
 
 class HistoryActor(nn.Module):
-    def __init__(self, output_dim=8, use_context=True):
+    def __init__(self, output_dim=2 * ACTION, use_context=True):
         super().__init__()
         self.use_context = use_context
         if use_context:
@@ -34,7 +34,11 @@ class HistoryActor(nn.Module):
             ]
             context = context * (length > 0).unsqueeze(-1)
             current = torch.cat((current, context.reshape(*features.shape[:-1], 64)), -1)
-        return self.mlp(current)
+        raw = self.mlp(current)
+        loc, raw_scale = raw.chunk(2, dim=-1)
+        # BenchMARL applies biased_softplus_1.0 to the second half.
+        # Bound pre-tanh means and keep standard deviations in a finite useful range.
+        return torch.cat((3 * torch.tanh(loc / 3), raw_scale.clamp(-3, 1)), -1)
 
 
 class ContextModel(Model):

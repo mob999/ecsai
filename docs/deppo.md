@@ -1,107 +1,81 @@
-# DEPPO-adapted：内容服务场景与 BenchMARL
+# DEPPO v2：共享带宽与稳定训练
 
-实现分三层：`edge-sim-models` 定义领域 DTO，`edge-sim-simgrid` 在独立进程中运行物理仿真，`edge-sim-learning` 负责观测、历史、奖励、采样和 BenchMARL MAPPO。SDK 不导入 NumPy、Torch、PettingZoo 或 BenchMARL；只安装 SDK 不会安装学习栈。
+本实现复现论文的统计观测、历史 GRU、参数化转发和带宽分配机制。合成请求与修正后的物理模型不用于声称复现论文表格数值。旧四维实验仍保留在历史输出目录；v2 必须从头训练，不兼容四维 checkpoint。
 
-验收测试、三种子小预算对照和 1/2/4 worker 数据见 [本机验收记录](deppo-validation.md)。完整 JSON 场景示例位于 `configs/learning/`。后续租用机器的 CUDA 检查和训练结果见 [Linux / 4090 验证记录](linux-validation.md)。最新本地优化、正确性对照和吞吐数据见 [采样性能验证](sampling-performance.md)。
+## 场景与 SDK
 
-## 安装与入口
+每个缓存节点总容量 `B_j` 固定，所属调度 agent 每 0.1 秒输出 `r`，回源容量 `r B_j`、交付容量 `(1-r) B_j`。这是 TDD 的流体容量抽象，无无线干扰/衰落/包级协议。不同缓存节点独立，不添加共享骨干。SimGrid 管理传输进度，周期边界更改原生链路容量，不重建活动传输。累计容量按时间分段积分。
 
-先按根 README 构建 SimGrid，再执行 `uv sync --locked --all-packages`。学习栈固定为 BenchMARL 1.5.2、TorchRL 0.10.1、TensorDict 0.10.0、PyTorch 2.9.1、PettingZoo 1.25.0，完整解析结果见 `uv.lock`。TorchRL 会提示其上游测试版本是 PettingZoo 1.24.3；本项目另行执行了 1.25.0 的 Parallel API 和 TorchRL spec 检查。
+SDK `ContentServiceSpec.bandwidth_mode` 默认 `independent`，保持已有用户的独立链路行为；`shared` 要求每个 `CacheNodeSpec.total_bandwidth_bytes_s` 有值且链路独占。`SchedulerControl.backhaul_ratio` 默认 0.5，范围 `[.05,.95]`。`coalesce_backhaul` 默认 true 保持 SDK 兼容；学习场景设 false，实现每请求独立回源。共享内容的存储预留仍只计一份。
 
-CPU smoke（16 个环境步，包含采样、更新、排空评估、checkpoint、CSV 和 W&B offline）：
+学习默认每类传输池 1 活动项、50 等待项，FIFO；调度等待 100，服务时间 1ms。保留 LRU 冷缓存、100MB 容量、完整对象下载、原始截止时间 1s、一次转发。配置并发数可恢复并发池。
 
-```sh
-uv run --package edge-sim-learning edge-learn train \
-  --profile smoke --output outputs/deppo-smoke \
-  --episodes 2 --workers 1 --batch 16 --epochs 1 --minibatch 8 \
-  --eval-interval 16 --eval-episodes 1 --wandb-mode offline
+三档规模为 `(3,10,300)`、`(5,20,1000)`、`(7,30,2000)`，分别表示集群、缓存和请求/s。内容目录 1000，Zipf 1.0，大小 0.5–7.5MB。拓扑种子固定 1729，目录/请求使用独立 RNG 流。缓存带宽权重 Uniform(1,3)，按 `request_rate * mean_size / delivery_load` 归一化总容量，默认理论交付负载比 .75，可选 .55/.95。每次运行另外报告实际目录热度加权的交付负载和冷缓存回源负载；前者不包含回源，不能理解为完整资源负载。
+
+`configs/learning/paper-audit.json` 按原文 12–36 Mbps 换算为 bytes/s，可能严重过载，仅用于容量审计；主实验使用校准配置，不暗改到达率。
+
+## 观测、动作和奖励
+
+当前观测 13 维：调度队列占用率、平均回源/交付负载、大小/剩余期限各 5 档频率直方图。actor 仅看本地；critic 拼接所有 agent 当前观测。观测打包为 158 维：13 + 8×(13+5) + 1 有效长度。
+
+每个 actor 输出 `(w1,w2,w3,b,r)`，前四维 `[-5,5]`，比例 `[.05,.95]`。请求转发由 `w·x+b >= 0` 决定，等价 sigmoid≥0.5。目标仍为最近广播的最低负载集群，本地按固定总容量加权轮转。GRU(18,64) 编码最近 8 个完成的观测—动作对，拼接当前观测，再经 ReLU MLP(128,128)。独立 actor、共享中心 critic。MAPPO-no-context 只去掉历史编码。
+
+业务奖励：
+
+`(completed - timed_out - rejected - .1 * sum(success_latency/deadline)) / max(1, request_rate*period)`
+
+请求仅在结束时结算一次，无请求结束为零。同步记录 `paper_reward=.5*window_success_rate+.5*actual_utilization`；`reward_mode=paper` 可做消融。利用率是实际传输字节除以容量时间积分。截断请求不伪装超时；训练正确 bootstrap。评估停止产生请求后排空，成功率含排空结果；episode return 只含前 128 个决策步，不包含排空奖励。
+
+## 训练与恢复
+
+默认 lr 1e-4、gamma .99、GAE .95、clip .1、entropy .001、梯度范数 .5。4 个 SDK worker，每批 512 环境步，整批更新 5 轮；不额外套 BenchMARL 多进程向量化。actor 潜在均值限制在 ±3，标准差经有限范围映射；保持 TanhNormal 的有界采样和 log probability 一致。
+
+每个 actor 计算旧/新高斯分布的解析 KL（两者使用相同 tanh/仿射变换）；任一 actor KL 超过 .02，停止该批剩余策略更新，critic 继续。记录每维动作均值/标准差/饱和率、loc/scale、各 actor KL、策略更新次数、梯度和损失。首次更新前检查行为策略 log probability 重算一致。
+
+按用户要求采用简单恢复：初始保存和每个批次完成后原子保存 `last.pt`（含优化器/RNG）；最佳验证模型保存 `best.pt`。出现非有限损失、梯度或参数时停止，写 `failure.json`，不覆盖健康 checkpoint。没有逐更新模型副本或自动回滚。用同场景/种子/worker 数续训，最多损失当前一个批次。
+
+```bash
+uv sync --all-packages --locked
+.venv/bin/python -m edge_sim_learning.cli train \
+  --profile small --output outputs/deppo-v2 --device cuda --wandb-mode offline
+.venv/bin/python -m edge_sim_learning.cli train \
+  --profile small --output outputs/deppo-v2 --device cuda --wandb-mode offline \
+  --resume outputs/deppo-v2/last.pt
+.venv/bin/python -m edge_sim_learning.cli evaluate \
+  --checkpoint outputs/deppo-v2/best.pt --split test --episodes 30 \
+  --output outputs/deppo-v2-test --wandb-mode offline
 ```
 
-正式实验在 Linux + NVIDIA GPU 上执行，每个种子分别运行：
+W&B 项目 `ecsai-deppo`，entity 使用 `WANDB_ENTITY`，明确选择 offline/online。CSV 同步保存，环境步是主横轴，agent 步另记。
 
-```sh
-uv run --package edge-sim-learning edge-learn train \
-  --profile small --seed 0 --device cuda --wandb-mode online \
-  --output outputs/deppo-small-seed0
+## 公平实验入口
+
+```bash
+# 本地完整流程的小预算验收（不证明收敛）
+.venv/bin/python scripts/run_deppo_v2.py --smoke --output outputs/deppo-v2-smoke
+# Linux/NVIDIA 正式实验
+.venv/bin/python scripts/run_deppo_v2.py --device cuda --profile small --load .75 \
+  --output outputs/deppo-v2-small --wandb-mode offline
 ```
 
-种子用 0、1、2；对照加 `--method MAPPO-no-context`。W&B 项目 `ecsai-deppo`，entity 取 `WANDB_ENTITY`，online 使用已登录账号或标准 `WANDB_API_KEY` 配置。必须显式指定 online/offline，不会默默切换。未在未配置账号的机器上执行 online 验证。
+入口先在验证集选择固定比例：0.1–0.9、步长0.1，分别结合 Random/Local/Forward。再对 DEPPO 和 MAPPO 各用种子0比较两种奖励×两档学习率(1e-4/3e-4)，每组65536步。按验证成功率优先、平均延迟次优选择配置，重新训练种子0/1/2各262144步。每8192步评估10个固定验证episode；最终30个独立测试episode不参与选择。
 
-默认预算 2048 episodes × 128 cycles = 262144 **环境步**，4 workers、每批 512 环境步、10 轮 minibatch 64 更新。agent 步数单独记为环境步数乘调度集群数。批次要求每个 worker 包含整数个 episode，保证保存/恢复边界明确。模拟和策略采样在 CPU；loss、GAE、反向传播与优化器在 `--device`。Torch 单线程避免每个采样进程重复争抢 CPU。
+基线：Random 每请求 Bernoulli(.5) 转发、每周期比例 Uniform(.4,.6)；Always-local/forward 比例 .5；Tuned-fixed 用验证集选出的最优规则/比例；Queue-adaptive 用回源剩余字节/两方向剩余字节分配比例、无积压时 .5，使用与 Random 一样的随机转发及固定目标选择。
 
-```sh
-# 使用同一固定评估请求种子集，末尾继续排空；读取 checkpoint 自带场景和模型
-uv run --package edge-sim-learning edge-learn evaluate \
-  --checkpoint outputs/deppo-smoke/best.pt --wandb-mode offline --output outputs/deppo-eval
-
-# 启发式，与学习方法使用相同评估种子和统计口径
-uv run --package edge-sim-learning edge-learn evaluate \
-  --profile small --method local --wandb-mode offline --output outputs/local-eval
-# --method random / forward
-
-# 恢复参数、优化器、计数器、随机状态；episodes 表示新的总预算
-uv run --package edge-sim-learning edge-learn train \
-  --profile smoke --episodes 4 --workers 1 --batch 16 --epochs 1 --minibatch 8 \
-  --eval-interval 16 --eval-episodes 1 --wandb-mode offline \
-  --resume outputs/deppo-smoke/last.pt --output outputs/deppo-resumed
-
-uv run --package edge-sim-learning edge-learn benchmark \
-  --profile small --workers 1 2 4 --steps 128 --wandb-mode offline --output outputs/deppo-benchmark
-
-# 自动跑两个学习方法各三种子、三种启发式、10 个相同评估 episode，以及 1/2/4 workers
-uv run --package edge-sim-learning python scripts/validate_learning.py
-```
-
-checkpoint 恢复在完整 episode 边界重建冷缓存物理进程，不恢复进行中的 native SimGrid 活动。训练场景/方法必须匹配；工作负载 episode 序号从已完成环境步继续。checkpoint 是本地 PyTorch 对象，只加载可信文件。最后和最佳 checkpoint 各保存一份，最佳依据排空后成功率，平局按成功请求平均延迟。
-
-## 场景与控制合同
-
-`small/medium/large` 分别为 3/5/7 个集群、10/20/30 个缓存、300/1000/2000 请求/s。`--scenario file.json` 可以直接提供完整或部分 `ScenarioConfig`（未写字段取默认值）。目录、拓扑、到达流各用独立 NumPy SeedSequence；动作随机数与生成请求无关。日志保存每个实际评估 episode 的 workload seed、请求数和理论交付负载比。
-
-默认内容 1000 项，Zipf 指数 1.0，大小均匀 0.5–7.5 **十进制 MB**，请求 Poisson 到达，截止 1s。每缓存 100 MB，回源和交付分别为 125000000 byte/s，即 1 Gbit/s，传播时延 20ms/5ms。配置可通过 `backhaul_bandwidth_bytes_s` / `delivery_bandwidth_bytes_s` 分别覆盖容量；未指定时使用公共默认 `bandwidth_bytes_s`。`backhaul_concurrency` / `delivery_concurrency`、`backhaul_waiting` / `delivery_waiting` 可分别覆盖并发和等待上限。每个缓存有自己的回源链路和交付链路；同一缓存到不同区域的交付共享该缓存交付链路。没有隐藏骨干瓶颈。理论交付负载比为 λ × 按内容热度加权的平均对象大小 / 所有交付链路总容量；数值大于 1 时不会降低请求率。
-
-每个调度器 1ms 服务时间、100 个 FIFO 等待位；每缓存每方向 8 个活动传输、50 个 FIFO 等待位。容量不含活动项。传输进度、共享链路速率及传播延迟均由 SimGrid `Comm` 决定。未设置 `TransferPoolSpec` 限制时保留无限并发；已有 DAG 模式保持原行为。
-
-每个缓存的同对象回源合并，各请求保留自己的截止时间、结果和交付流。最后一个等待者超时才取消合并回源。完整对象回源后才开始交付；不模拟分片或播放。LRU 在请求命中时刷新，冷缓存开局；尚在交付的对象暂时固定，不能驱逐。没有空间容纳新对象时明确拒绝 `storage_capacity`，计入拒绝率而非队列溢出率。回源等待项按唯一对象传输计数，交付等待项按请求计数。
-
-SDK 的 `RunSpec(control_mode="window", content=ContentServiceSpec(...))` 选择周期控制。`Session.advance_window(until_s, WindowControl(...))` 或 `BatchRunner.submit_window/recv_ready` 驱动；同一 run 禁止混用 `advance/apply`。进程内控制器用 `Serve(request_id, cache_node)` 内容服务操作，保持对象 ID 不变，无虚构 DAG 计算阶段。控制 DTO 不包含 reward 或网络参数张量。
-
-边界先处理已有传输完成、截止事件与已开始的调度服务完成；到达时间恰等于边界的新请求在下一次调用中接纳。精确截止时交付完成判成功。新参数作用于下一周期的服务决策；已提交给某个传输池的工作不重新选择节点。转发不重置截止时间，最多一次，目标队列满立即拒绝。邻居负载广播只在周期开始更新，按 `0.5 × 缓存平均服务负载 + 0.5 × 调度队列占用率` 排序，同负载按 ID。缓存分配使用交付容量加权的 smooth weighted round robin。
-
-`WindowResult.view` 只返回存活请求与本窗口新结束请求，避免每步传输完整历史；`latencies_s` 也只包含本窗口成功延迟。`Session.result()` 可读取全体请求结果。链路字节/容量时间与队列计数为累计值；`WindowResult.link_bytes`、completed/timed_out/rejected 为区间增量。trace 开启时记录进入服务、等待、完成、取消、溢出与转发事件。
-
-## 学习合同
-
-每 agent 当前观测 13 维：调度等待占用率、所属缓存平均回源负载/交付负载、大小直方图 5 档、剩余期限直方图 5 档。负载分母为对应活动上限加等待上限。直方图只统计调度等待请求，区间为归一化后的 `[0,1]` 等宽五档，按队列总数归一化；空队列为零。
-
-PettingZoo observation 实际打包为 150 维：当前 13 + 最近 8 个 `(13 observation,4 action)` 对 + 1 有效长度。历史按时间顺序从前填入，剩余位置补零；每次 reset 清空。critic 的 `state` 单独提供全体 agent **当前**观测的拼接，没有历史。actor 仅读取自己的 150 维。
-
-DEPPO actor 每 agent 独立：GRU(17,64)，取有效长度位置输出；空历史强制零；拼接当前 13 维后经 ReLU MLP(128,128)。不把 GRU 隐状态保存在 collector 中，PPO minibatch 可以精确重算同一个窗口。MAPPO-no-context 接收同一观测但只使用前 13 维。两者共享一个中心 critic ReLU MLP(128,128)。动作由 TanhNormal 限制在 `[-5,5]^4`。阈值用 `w·x+b >= 0`，等价于 sigmoid ≥ 0.5。
-
-学习率 3e-4，gamma .99，GAE λ .95，PPO clip .2；BenchMARL 默认 entropy coefficient 0、critic coefficient 1、Adam epsilon 1e-6、梯度范数裁剪 5。初期未针对本场景调参。
-
-奖励 = .5 × 本周期成功数/结束数 + .5 × 本周期链路实际发送字节/容量时间。结束数包括成功、超时、拒绝，无结束请求时第一项零。所有 agent 获得同一奖励。128 周期后 `truncated=True, terminated=False`；TorchRL GAE 使用 terminated 处理 bootstrap。训练截断的未完成请求单独记录，不伪装超时。评估使用同一截断前 return，同时停止新到达、沿用最后动作排空至全部完成/截止，再计算服务指标。延迟仅统计成功请求。
-
-## 产物与计时
-
-每次训练目录包含 `config.json`、长表 `metrics.csv`、`last.pt`、`best.pt`、`evaluation-*.json`、BenchMARL CSV 和 `wandb/offline-run-*`。W&B 标量默认横轴为 `env_steps`，同时保存 `wall_s`，可在 UI 切换。每 8192 步以及训练结束做固定评估，默认 10 个 episode，种子从 1000000000 起，与训练种子隔离。
-
-指标覆盖 reward/return、actor/critic loss、entropy、成功/超时/拒绝/溢出、未完成、成功延迟 p50/p95/p99、命中率、回源/交付字节和利用率、队列与转发、采样与请求吞吐。
-
-`simulation_wall_s` 为 worker 内周期执行耗时；`ipc_wall_s` 为提交到收到回应减去 worker 执行耗时，包含进程等待与串行打包，不是纯网络传输时间。推理计时来自 collector policy forward hooks，训练计时覆盖 GAE、buffer/minibatch 与优化。多 worker 的 worker-seconds 可以大于墙钟秒，不应相加当作端到端时间。benchmark 单独记录启动耗时，其采样耗时包含 episode 重建冷缓存进程的成本；smoke episode 很短，进程重启成本可能主导吞吐。
+脚本保存任务签名与完成标记，重复运行跳过已完成任务；中断训练从 last.pt 恢复。改变配置必须换输出目录。输出 comparison.json/CSV、三种子波动及按训练种子和配对工作负载分层 bootstrap 的95%区间（2000次）。测试前核验所有方法工作负载一致。小样本区间仅用于描述不确定性，不保证 DEPPO 胜出。
 
 ## 论文—实现差异
 
-| 项目 | 本实现及解释 |
-| --- | --- |
-| 五维动作 | 四维参数化转发，移除带宽比例动作；物理链路容量固定配置 |
-| 拓扑与链路 | 有线回源、独立用户交付，显式链路竞争，无隐式全局无线瓶颈 |
-| 请求数据 | 合成 Poisson + Zipf；不声称复现论文表格数值 |
-| 传输/队列 | FIFO 等待、并发共享带宽、合并回源、独立交付、显式超时取消 |
-| 缓存 | 所有方法同一冷启动 LRU；完整对象，交付中对象固定 |
-| reward | 团队周期成功率与实际链路利用率各 .5，非原奖励逐项复写 |
-| 历史网络 | 显式 8 对窗口、GRU64、ReLU MLP128×2，是补充的可复现实验定义 |
-| 对照命名 | `MAPPO-no-context`，不称为原论文 DD；Random 为进程内逐请求随机本地/转发 |
-| 截断 | 训练正确 bootstrap；评估排空，单独报告截断未完成数 |
+| 项目 | 原文 | v2 |
+|---|---|---|
+| 带宽动作 | 回源/交付比例 | 恢复，限制 .05–.95 避免断流 |
+| 带宽数值 | 12–36 Mbps | 原值保留审计；主实验按公开负载比校准 |
+| 利用率公式 | 式(11)文字代入为闲置比例 | 修正为实际利用率 |
+| 主奖励 | 成功率与利用率各 .5 | 成功/失败计数与小延迟惩罚，原风格作消融 |
+| 数据 | Douyin 实际数据 | Poisson/Zipf 合成数据 |
+| 网络 | TDD、FIFO 延迟公式 | SimGrid 流体容量动态更新、默认串行 FIFO |
+| 历史网络细节 | 部分参数未说明 | 明确窗口8、GRU64、两层MLP128 |
+| PPO | lr3e-4、clip.2 | 保守默认与等预算验证搜索，KL停止 |
+| 对照 | RD/FO/DO/SAC/DD | RD/FO/DO、固定比例调优、自适应启发式、无历史MAPPO；不冒充DD/SAC |
 
-本阶段不实现监督预训练、完整离线 rollout 导出或新 UI。未来采样/预训练可复用 13 维观测、4 维动作、8 对窗口和独立环境，不改物理 SDK。
+本阶段不改变转发目标/本地调度目标算法，不实现监督预训练。

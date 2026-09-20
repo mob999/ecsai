@@ -13,7 +13,7 @@ from .scenario import ScenarioConfig, build_run
 
 HISTORY = 8
 OBS = 13
-ACTION = 4
+ACTION = 5
 FEATURES = OBS + HISTORY * (OBS + ACTION) + 1
 
 
@@ -33,7 +33,11 @@ class SchedulingEnv(ParallelEnv):
         self.state_space = Box(-np.inf, np.inf, (OBS * self.config.clusters,), np.float32)
         self.last_metrics = {}
         self._observation_space = Box(-np.inf, np.inf, (FEATURES,), np.float32)
-        self._action_space = Box(-5, 5, (ACTION,), np.float32)
+        self._action_space = Box(
+            np.array([-5] * 4 + [0.05], np.float32),
+            np.array([5] * 4 + [0.95], np.float32),
+            dtype=np.float32,
+        )
 
     def observation_space(self, agent):
         return self._observation_space
@@ -160,7 +164,11 @@ class SchedulingEnv(ParallelEnv):
         return WindowControl(
             policy=policy,
             schedulers=tuple(
-                SchedulerControl(cluster_id=a, weights=tuple(float(v) for v in actions[a]))
+                SchedulerControl(
+                    cluster_id=a,
+                    weights=tuple(float(v) for v in actions[a][:4]),
+                    backhaul_ratio=float(np.clip(actions[a][4], 0.05, 0.95)),
+                )
                 for a in self.possible_agents
             ),
         )
@@ -207,11 +215,20 @@ class SchedulingEnv(ParallelEnv):
         utilization = (
             sum(link.bytes_sent for link in response.link_bytes) / capacity if capacity else 0
         )
-        reward = 0.5 * success + 0.5 * utilization
+        paper_reward = 0.5 * success + 0.5 * utilization
+        business_reward = (
+            response.completed
+            - response.timed_out
+            - response.rejected
+            - 0.1 * sum(response.view.latencies_s) / self.config.deadline_s
+        ) / max(1, self.config.request_rate * self.config.period_s)
+        reward = paper_reward if self.config.reward_mode == "paper" else business_reward
         self.episode_return += reward
         done = self.cycle >= self.config.cycles
         self.last_metrics = self.metrics() | {
             "reward": reward,
+            "paper_reward": paper_reward,
+            "business_reward": business_reward,
             "episode_return": self.episode_return,
             "simulation_wall_s": response.simulation_wall_s,
             "ipc_wall_s": max(0, wall - response.simulation_wall_s),

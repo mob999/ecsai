@@ -1,4 +1,10 @@
 {
+  "bandwidth_mode": "shared",
+  "capacity_profile": "calibrated",
+  "delivery_load": 0.75,
+  "topology_seed": 1729,
+  "coalesce_backhaul": false,
+  "reward_mode": "business",
   "clusters": 2,
   "caches": 2,
   "request_rate": 30.0,
@@ -20,7 +26,7 @@
   "backhaul_latency_s": 0.02,
   "delivery_latency_s": 0.005,
   "queue_capacity": 50,
-  "transfer_concurrency": 8,
+  "transfer_concurrency": 1,
   "scheduler_capacity": 100,
   "scheduler_service_s": 0.001
 }

@@ -267,3 +267,63 @@ def test_simultaneous_delivery_completions_win_exact_deadline():
         assert out.completed == 2 and out.timed_out == 0
         assert not out.view.transfers
         assert sum(link.bytes_sent for link in out.link_bytes) == pytest.approx(400)
+
+
+def shared_budget(run, total=200):
+    return run.model_copy(
+        update={
+            "content": run.content.model_copy(
+                update={
+                    "bandwidth_mode": "shared",
+                    "coalesce_backhaul": False,
+                    "caches": tuple(
+                        c.model_copy(update={"total_bandwidth_bytes_s": total})
+                        for c in run.content.caches
+                    ),
+                }
+            )
+        }
+    )
+
+
+def ratio_control(run, ratio):
+    return WindowControl(
+        schedulers=tuple(
+            SchedulerControl(cluster_id=s.id, backhaul_ratio=ratio) for s in run.content.schedulers
+        )
+    )
+
+
+def test_live_bandwidth_change_preserves_progress_and_integrates_capacity():
+    run = shared_budget(scenario([("r", "a", 0, 0, 10)], active=1))
+    with start(run) as session:
+        first = session.advance_window(0.501, ratio_control(run, 0.5))
+        transfer = first.view.transfers[0]
+        assert transfer.remaining_bytes == pytest.approx(50)
+        second = session.advance_window(0.751, ratio_control(run, 0.25))
+        assert second.view.transfers[0].transfer_id == transfer.transfer_id
+        assert second.view.transfers[0].remaining_bytes == pytest.approx(37.5)
+        capacities = {x.link_id: x.capacity_byte_seconds for x in second.view.links}
+        assert capacities == pytest.approx({"b0": 50.1 + 12.5, "d0": 50.1 + 37.5})
+        final = session.advance_window(3, ratio_control(run, 0.25))
+        assert final.view.completed == 1
+        assert final.view.requests[0].completed_s == pytest.approx(1.501 + 100 / 150)
+        assert sum(x.capacity_byte_seconds for x in final.view.links) == pytest.approx(600)
+
+
+def test_unmerged_duplicate_fetches_and_cancellation_share_storage_safely():
+    run = shared_budget(
+        scenario(
+            [("r0", "a", 0, 0, 0.5), ("r1", "a", 0, 0.01, 10), ("r2", "a", 0, 0.02, 10)],
+            active=1,
+            storage=100,
+        )
+    )
+    with start(run) as session:
+        early = session.advance_window(0.1, ratio_control(run, 0.5))
+        assert len(early.view.transfers) == 3
+        assert all(len(t.request_ids) == 1 for t in early.view.transfers)
+        final = session.advance_window(8, ratio_control(run, 0.5))
+        assert (final.view.completed, final.view.timed_out, final.view.rejected) == (2, 1, 0)
+        backhaul = next(x for x in final.view.links if x.link_id == "b0")
+        assert backhaul.bytes_sent == pytest.approx(249.9)

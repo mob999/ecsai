@@ -34,6 +34,8 @@ class ContentBatchEnv(EnvBase):
             self.envs[0].last_metrics.keys()
             | {
                 "reward",
+                "paper_reward",
+                "business_reward",
                 "episode_return",
                 "simulation_wall_s",
                 "ipc_wall_s",

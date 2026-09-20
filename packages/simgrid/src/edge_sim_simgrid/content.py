@@ -61,6 +61,7 @@ class Transfer:
     activity: object = None
     accounted_remaining: float = 0.0
     order: int = 0
+    fetch_key: tuple | None = None
 
 
 class ContentRuntime:
@@ -88,11 +89,16 @@ class ContentRuntime:
             for link in (cache.backhaul_link, cache.delivery_link)
         }
         self.links = {link.id: link for link in run.scenario.links if link.id in controlled_links}
+        self.link_rates = {lid: link.bandwidth_bytes_s for lid, link in self.links.items()}
+        self.link_capacity = Counter()
+        self.capacity_clock = 0.0
+        self.native_links = {lid: sg.Link.by_name(lid) for lid in self.links}
         self.routes = {(r.src, r.dst): r.links for r in run.scenario.routes}
         self.artifacts = {a.id: a for a in run.scenario.artifacts}
         self.hosts = {n: sg.Host.by_name(n) for n in self.nodes}
         self.delivery_weights = {
-            c: self.links[cfg.delivery_link].bandwidth_bytes_s for c, cfg in self.caches.items()
+            c: (cfg.total_bandwidth_bytes_s or self.links[cfg.delivery_link].bandwidth_bytes_s)
+            for c, cfg in self.caches.items()
         }
         self.cluster_weights = {
             s: sum(self.delivery_weights[c] for c in caches)
@@ -103,6 +109,7 @@ class ContentRuntime:
         self.active = {(c, k): {} for c in self.caches for k in ("backhaul", "delivery")}
         self.waiting = {key: deque() for key in self.active}
         self.fetches = {}
+        self.fetch_counts = Counter()
         self.transfers = {}
         self.activities = {}
         self.pending = sg.ActivitySet([])
@@ -205,14 +212,40 @@ class ContentRuntime:
     def _pinned(self, cache, aid):
         return self.pins[cache, aid] > 0
 
+    def _fetch_key(self, cache, aid, rid):
+        return (cache, aid) if self.spec.coalesce_backhaul else (cache, aid, rid)
+
+    def _account_capacity(self):
+        elapsed = self.now - self.capacity_clock
+        for lid, rate in self.link_rates.items():
+            self.link_capacity[lid] += elapsed * rate
+        self.capacity_clock = self.now
+
+    def _set_bandwidth(self, control):
+        self._account_capacity()
+        if self.spec.bandwidth_mode != "shared":
+            return
+        ratios = {c.cluster_id: c.backhaul_ratio for c in control.schedulers}
+        for cache in self.caches.values():
+            r = ratios[cache.cluster_id]
+            for lid, fraction in ((cache.backhaul_link, r), (cache.delivery_link, 1 - r)):
+                rate = cache.total_bandwidth_bytes_s * fraction
+                self.native_links[lid].set_bandwidth(rate)
+                self.link_rates[lid] = rate
+        self.emit("bandwidth_allocated", "network", ratios=str(ratios))
+
     def _reserve(self, cache, aid):
+        if aid in self.reserved[cache] or aid in self.replicas[cache]:
+            return True
         size = self.artifacts[aid].size_bytes
         capacity = self.nodes[cache].storage_bytes
-        used = sum(self.replicas[cache].values()) + sum(self.reserved[cache].values())
+        used = sum(self.replicas[cache].values()) + sum(
+            v for k, v in self.reserved[cache].items() if k not in self.replicas[cache]
+        )
         for old in list(self.replicas[cache]):
             if used + size <= capacity:
                 break
-            if not self._pinned(cache, old):
+            if not self._pinned(cache, old) and old not in self.reserved[cache]:
                 used -= self.replicas[cache].pop(old)
                 self.emit("cache_evict", old, node_id=cache)
         if used + size > capacity:
@@ -231,8 +264,8 @@ class ContentRuntime:
             self.counts["cache_hits"] += 1
             self.replicas[cache].move_to_end(aid)
             self._delivery(rid)
-        elif (cache, aid) in self.fetches:
-            transfer = self.fetches[cache, aid]
+        elif self._fetch_key(cache, aid, rid) in self.fetches:
+            transfer = self.fetches[self._fetch_key(cache, aid, rid)]
             transfer.waiters.add(rid)
             self.request_transfer[rid] = transfer
             request.status = "WAITING_DATA"
@@ -242,7 +275,9 @@ class ContentRuntime:
                 return
             request.status = "WAITING_DATA"
             transfer = self._new_transfer(aid, cache, "backhaul", self.spec.origin, cache, {rid})
-            self.fetches[cache, aid] = transfer
+            transfer.fetch_key = self._fetch_key(cache, aid, rid)
+            self.fetches[transfer.fetch_key] = transfer
+            self.fetch_counts[cache, aid] += 1
             self._admit(transfer)
 
     def _new_transfer(self, aid, cache, kind, src, dst, waiters):
@@ -325,8 +360,11 @@ class ContentRuntime:
             if not self.pins[t.cache, t.artifact]:
                 del self.pins[t.cache, t.artifact]
         if t.kind == "backhaul":
-            self.fetches.pop((t.cache, t.artifact), None)
-            self.reserved[t.cache].pop(t.artifact, None)
+            self.fetches.pop(t.fetch_key, None)
+            self.fetch_counts[t.cache, t.artifact] -= 1
+            if not self.fetch_counts[t.cache, t.artifact]:
+                del self.fetch_counts[t.cache, t.artifact]
+                self.reserved[t.cache].pop(t.artifact, None)
         if cancelled:
             self.counts["cancelled_transfers"] += 1
             if t.activity is not None:
@@ -462,6 +500,7 @@ class ContentRuntime:
             until_s = min(until_s, self.run.until_s)
             if until_s <= self.now:
                 raise CommandError("finished", "run time limit reached")
+        self._set_bandwidth(control)
         self.control = control
         self.control_weights = {c.cluster_id: c.weights for c in control.schedulers}
         self.broadcast = {
@@ -504,7 +543,7 @@ class ContentRuntime:
                 LinkCounter(
                     link_id=lid,
                     bytes_sent=self.link_bytes[lid] - link_before[lid],
-                    capacity_byte_seconds=(self.now - start) * link.bandwidth_bytes_s,
+                    capacity_byte_seconds=(self.now - start) * self.link_rates[lid],
                 )
                 for lid, link in sorted(self.links.items())
             ),
@@ -512,6 +551,7 @@ class ContentRuntime:
         )
 
     def inspect(self, selection=None, *, scope="full"):
+        self._account_capacity()
         for t in self.activities.values():
             self._account_bytes(t)
         selected = self.live | self.changed if selection is None else set(selection)
@@ -539,6 +579,10 @@ class ContentRuntime:
                     waiting=len(self.waiting[c, k]),
                     max_active=self._pool_spec((c, k)).max_active,
                     max_waiting=self._pool_spec((c, k)).max_waiting,
+                    remaining_bytes=sum(
+                        max(0, t.activity.remaining) for t in self.active[c, k].values()
+                    )
+                    + sum(self.artifacts[t.artifact].size_bytes for t in self.waiting[c, k]),
                 )
                 for c, k in sorted(self.active)
             ),
@@ -582,7 +626,7 @@ class ContentRuntime:
                 LinkCounter(
                     link_id=lid,
                     bytes_sent=self.link_bytes[lid],
-                    capacity_byte_seconds=self.now * link.bandwidth_bytes_s,
+                    capacity_byte_seconds=self.link_capacity[lid],
                 )
                 for lid, link in sorted(self.links.items())
             ),

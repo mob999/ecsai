@@ -5,7 +5,7 @@ import pytest
 
 pytest.importorskip("benchmarl")
 import torch
-from edge_sim_learning.env import FEATURES, OBS, SchedulingEnv
+from edge_sim_learning.env import ACTION, FEATURES, OBS, SchedulingEnv
 from edge_sim_learning.model import ContextModel, HistoryActor
 from edge_sim_learning.scenario import ScenarioConfig, build_run
 from edge_sim_learning.torch_env import ContentBatchEnv
@@ -38,19 +38,21 @@ def test_parallel_api_history_reward_and_reset():
     try:
         parallel_api_test(env, num_cycles=10)
         obs, _ = env.reset(seed=3)
-        actions = {a: np.array([0, 0, 0, -5], np.float32) for a in env.agents}
+        actions = {a: np.array([0, 0, 0, -5, 0.5], np.float32) for a in env.agents}
         assert all(not o.any() for o in obs.values())
         env.begin(actions)
         response = env.response
-        n = response.completed + response.timed_out + response.rejected
-        expected = 0.5 * (response.completed / n if n else 0) + 0.5 * sum(
-            link.bytes_sent for link in response.link_bytes
-        ) / sum(link.capacity_byte_seconds for link in response.link_bytes)
+        expected = (
+            response.completed
+            - response.timed_out
+            - response.rejected
+            - 0.1 * sum(response.view.latencies_s) / cfg.deadline_s
+        ) / max(1, cfg.request_rate * cfg.period_s)
         obs, reward, terminated, truncated, _ = env.step(actions)
         assert all(r == pytest.approx(expected) for r in reward.values())
         for a, o in obs.items():
             assert o[-1] == 1
-            assert np.array_equal(o[OBS + OBS : OBS + OBS + 4], actions[a])
+            assert np.array_equal(o[OBS + OBS : OBS + OBS + ACTION], actions[a])
         for _ in range(cfg.cycles - 1):
             obs, _, terminated, truncated, _ = env.step(actions)
         assert not any(terminated.values()) and all(truncated.values())
@@ -97,7 +99,7 @@ def test_history_padding_no_context_and_gradients():
     x[:, OBS:-1] = torch.randn_like(x[:, OBS:-1])
     y = actor(x)
     x2 = x.clone()
-    x2[:, OBS + 3 * 17 : -1] = 100
+    x2[:, OBS + 3 * (OBS + ACTION) : -1] = 100
     assert torch.equal(y, actor(x2))
     y.sum().backward()
     assert actor.gru.weight_ih_l0.grad.abs().sum() > 0
@@ -158,7 +160,9 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
         for state in optimizer["state"].values()
         if "exp_avg" in state
     ]
-    assert any(tuple(moment.shape) == (192, 17) and moment.abs().sum() > 0 for moment in moments)
+    assert any(
+        tuple(moment.shape) == (192, OBS + ACTION) and moment.abs().sum() > 0 for moment in moments
+    )
     common["episodes"] = 4
     train(output=tmp_path / "restored", resume=tmp_path / "first" / "last.pt", **common)
     restored = torch.load(tmp_path / "restored" / "last.pt", weights_only=False)
@@ -188,6 +192,7 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
 def test_backhaul_and_delivery_configured_independently():
     config = ScenarioConfig.profile("smoke").model_copy(
         update={
+            "bandwidth_mode": "independent",
             "backhaul_bandwidth_bytes_s": 1000,
             "delivery_bandwidth_bytes_s": 2000,
             "backhaul_concurrency": 2,
@@ -238,7 +243,9 @@ def test_ready_batch_slots_match_independent_episodes():
         for env in singles:
             env.reset()
         for _ in range(config.cycles):
-            actions = torch.tensor([[[0, 0, 0, -5]] * 2, [[0, 0, 0, 5]] * 2], dtype=torch.float32)
+            actions = torch.tensor(
+                [[[0, 0, 0, -5, 0.5]] * 2, [[0, 0, 0, 5, 0.5]] * 2], dtype=torch.float32
+            )
             td["agents", "action"] = actions
             following = batch.step(td)["next"]
             for i, env in enumerate(singles):
@@ -305,3 +312,75 @@ def test_cuda_checkpoint_resume(tmp_path):
     assert payload["experiment"]["state"]["total_frames"] == 16
     assert payload["cuda_rng"]
     assert all(torch.isfinite(p).all() for p in payload["policy"].parameters())
+
+
+def test_capacity_profiles_and_fixed_topology():
+    cfg = ScenarioConfig.profile("small")
+    first, meta = build_run(cfg, 0)
+    second, _ = build_run(cfg, 1)
+    assert first.content.caches == second.content.caches
+    assert first.scenario.links == second.scenario.links
+    assert sum(c.total_bandwidth_bytes_s for c in first.content.caches) == pytest.approx(
+        cfg.request_rate * (cfg.min_size + cfg.max_size) / 2 / cfg.delivery_load
+    )
+    assert all(c.backhaul.max_active == 1 for c in first.content.caches)
+    assert not first.content.coalesce_backhaul
+    audit, _ = build_run(cfg.model_copy(update={"capacity_profile": "paper-audit"}), 0)
+    assert all(12e6 / 8 <= c.total_bandwidth_bytes_s <= 36e6 / 8 for c in audit.content.caches)
+    assert meta["expected_backhaul_load_cold"] == meta["expected_delivery_load"]
+
+
+def test_bounded_distribution_extremes_and_probability_recomputation():
+    from tensordict.nn import NormalParamExtractor
+    from torchrl.modules import TanhNormal
+
+    model = HistoryActor()
+    x = torch.full((32, FEATURES), 1e6)
+    x[:, -1] = 8
+    loc, scale = NormalParamExtractor(scale_mapping="biased_softplus_1.0")(model(x))
+    assert loc.abs().max() <= 3
+    assert scale.min() > 0 and scale.max() < 2
+    low, high = torch.tensor([-5.0] * 4 + [0.05]), torch.tensor([5.0] * 4 + [0.95])
+    dist = TanhNormal(loc, scale, low=low, high=high, safe_tanh=True)
+    action = dist.sample()
+    lp = dist.log_prob(action)
+    assert torch.isfinite(lp).all()
+    assert torch.equal(lp, TanhNormal(loc, scale, low=low, high=high).log_prob(action))
+
+
+def test_kl_stop_and_nonfinite_update_preserves_checkpoint(tmp_path, monkeypatch):
+    from edge_sim_learning.experiment import train
+    from edge_sim_learning.stability import StableExperiment
+
+    common = dict(
+        scenario=ScenarioConfig.profile("smoke"),
+        episodes=2,
+        workers=1,
+        frames_per_batch=16,
+        minibatch=16,
+        epochs=3,
+        eval_interval=16,
+        eval_episodes=1,
+    )
+    monkeypatch.setattr(StableExperiment, "target_kl", 1e-12)
+    train(output=tmp_path / "kl", **common)
+    import csv
+
+    rows = list(csv.DictReader((tmp_path / "kl/metrics.csv").open()))
+    assert any(r["metric"] == "train/kl_early_stop" and float(r["value"]) == 1 for r in rows)
+    assert any(r["metric"] == "train/actor_updates" and float(r["value"]) == 1 for r in rows)
+    original = torch.optim.Adam.step
+
+    def corrupt(optimizer, *args, **kwargs):
+        result = original(optimizer, *args, **kwargs)
+        with torch.no_grad():
+            optimizer.param_groups[0]["params"][0].fill_(float("nan"))
+        return result
+
+    monkeypatch.setattr(torch.optim.Adam, "step", corrupt)
+    with pytest.raises(FloatingPointError, match="last healthy checkpoint"):
+        train(output=tmp_path / "bad", **common)
+    payload = torch.load(tmp_path / "bad/last.pt", weights_only=False)
+    assert payload["experiment"]["state"]["total_frames"] == 0
+    assert all(torch.isfinite(p).all() for p in payload["policy"].parameters())
+    assert (tmp_path / "bad/failure.json").exists()

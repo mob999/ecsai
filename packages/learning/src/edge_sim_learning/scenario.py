@@ -1,5 +1,7 @@
 """Versioned synthetic workloads; policy-independent random streams."""
 
+from typing import Literal
+
 import numpy as np
 from edge_sim_models import (
     ArtifactSpec,
@@ -19,6 +21,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ScenarioConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    bandwidth_mode: Literal["independent", "shared"] = "shared"
+    capacity_profile: Literal["calibrated", "paper-audit"] = "calibrated"
+    delivery_load: float = Field(default=0.75, gt=0)
+    topology_seed: int = 1729
+    coalesce_backhaul: bool = False
+    reward_mode: Literal["business", "paper"] = "business"
     clusters: int = Field(default=3, ge=2)
     caches: int = Field(default=10, ge=2)
     request_rate: float = Field(default=300, gt=0)
@@ -40,7 +48,7 @@ class ScenarioConfig(BaseModel):
     backhaul_latency_s: float = Field(default=0.02, ge=0)
     delivery_latency_s: float = Field(default=0.005, ge=0)
     queue_capacity: int = Field(default=50, ge=0)
-    transfer_concurrency: int = Field(default=8, ge=1)
+    transfer_concurrency: int = Field(default=1, ge=1)
     scheduler_capacity: int = Field(default=100, ge=0)
     scheduler_service_s: float = Field(default=0.001, gt=0)
 
@@ -68,7 +76,8 @@ class ScenarioConfig(BaseModel):
 def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
     if config.caches < config.clusters or config.max_size < config.min_size:
         raise ValueError("each cluster needs a cache and size bounds must be ordered")
-    topology_seed, catalog_seed, arrivals_seed = np.random.SeedSequence(seed).spawn(3)
+    _, catalog_seed, arrivals_seed = np.random.SeedSequence(seed).spawn(3)
+    topology_seed = config.topology_seed
     topo, catalog, arrivals = (
         np.random.default_rng(s) for s in (topology_seed, catalog_seed, arrivals_seed)
     )
@@ -100,6 +109,18 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         )
     caches, links, routes = [], [], []
     ownership = topo.permutation(config.caches) % config.clusters
+    capacities = topo.uniform(1, 3, config.caches)
+    if config.capacity_profile == "paper-audit":
+        capacities *= 12_000_000 / 8  # Mbps -> bytes/s, not MB/s
+    else:
+        # Use the distribution expectation, independent of evaluation catalogue draws.
+        capacities *= (
+            config.request_rate
+            * (config.min_size + config.max_size)
+            / 2
+            / config.delivery_load
+            / capacities.sum()
+        )
     pool = TransferPoolSpec(
         max_active=config.transfer_concurrency, max_waiting=config.queue_capacity
     )
@@ -112,12 +133,16 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
             (
                 LinkSpec(
                     id=backhaul,
-                    bandwidth_bytes_s=config.backhaul_bandwidth_bytes_s or config.bandwidth_bytes_s,
+                    bandwidth_bytes_s=float(capacities[i] / 2)
+                    if config.bandwidth_mode == "shared"
+                    else config.backhaul_bandwidth_bytes_s or config.bandwidth_bytes_s,
                     latency_s=config.backhaul_latency_s,
                 ),
                 LinkSpec(
                     id=delivery,
-                    bandwidth_bytes_s=config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s,
+                    bandwidth_bytes_s=float(capacities[i] / 2)
+                    if config.bandwidth_mode == "shared"
+                    else config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s,
                     latency_s=config.delivery_latency_s,
                 ),
             )
@@ -130,6 +155,9 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
             CacheNodeSpec(
                 node_id=node,
                 cluster_id=f"cluster-{ownership[i]}",
+                total_bandwidth_bytes_s=float(capacities[i])
+                if config.bandwidth_mode == "shared"
+                else None,
                 backhaul_link=backhaul,
                 delivery_link=delivery,
                 backhaul=TransferPoolSpec(
@@ -175,6 +203,8 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         ),
         content=ContentServiceSpec(
             origin="origin",
+            bandwidth_mode=config.bandwidth_mode,
+            coalesce_backhaul=config.coalesce_backhaul,
             schedulers=schedulers,
             caches=tuple(caches),
             requests=tuple(requests),
@@ -186,7 +216,24 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         "expected_delivery_load": float(
             config.request_rate
             * (sizes * popularity).sum()
-            / (config.caches * (config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s))
+            / (
+                capacities.sum()
+                if config.bandwidth_mode == "shared"
+                else config.caches * (config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s)
+            )
+        ),
+        "configured_delivery_load": config.delivery_load,
+        "total_bandwidth_bytes_s": float(capacities.sum())
+        if config.bandwidth_mode == "shared"
+        else sum(link.bandwidth_bytes_s for link in links),
+        "expected_backhaul_load_cold": float(
+            config.request_rate
+            * (sizes * popularity).sum()
+            / (
+                capacities.sum()
+                if config.bandwidth_mode == "shared"
+                else config.caches * (config.backhaul_bandwidth_bytes_s or config.bandwidth_bytes_s)
+            )
         ),
         "request_count": len(requests),
         "seed": seed,

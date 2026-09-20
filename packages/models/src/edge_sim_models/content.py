@@ -17,6 +17,7 @@ class CacheNodeSpec(DTO):
     cluster_id: Identifier
     backhaul_link: Identifier
     delivery_link: Identifier
+    total_bandwidth_bytes_s: PositiveFloat | None = None
     backhaul: TransferPoolSpec = Field(default_factory=TransferPoolSpec)
     delivery: TransferPoolSpec = Field(default_factory=TransferPoolSpec)
 
@@ -44,6 +45,8 @@ class ContentRequest(DTO):
 
 class ContentServiceSpec(DTO):
     origin: Identifier
+    bandwidth_mode: Literal["independent", "shared"] = "independent"
+    coalesce_backhaul: bool = True
     schedulers: tuple[SchedulerSpec, ...]
     caches: tuple[CacheNodeSpec, ...]
     requests: tuple[ContentRequest, ...]
@@ -59,6 +62,12 @@ class ContentServiceSpec(DTO):
         ):
             if len(values) != len(set(values)):
                 raise ValueError("duplicate content-service IDs")
+        if self.bandwidth_mode == "shared":
+            if any(c.total_bandwidth_bytes_s is None for c in self.caches):
+                raise ValueError("shared bandwidth requires a total capacity per cache")
+            links = [link for c in self.caches for link in (c.backhaul_link, c.delivery_link)]
+            if len(set(links)) != len(links):
+                raise ValueError("shared bandwidth requires dedicated links per cache")
         schedulers = {s.id for s in self.schedulers}
         if not schedulers or not self.caches:
             raise ValueError("content service needs schedulers and caches")
@@ -72,6 +81,7 @@ class ContentServiceSpec(DTO):
 
 
 class SchedulerControl(DTO):
+    backhaul_ratio: Annotated[float, Field(ge=0.05, le=0.95, allow_inf_nan=False)] = 0.5
     cluster_id: Identifier
     weights: tuple[
         Annotated[float, Field(ge=-5, le=5, allow_inf_nan=False)],
@@ -107,6 +117,7 @@ class PoolState(DTO):
     waiting: Count
     max_active: Count | None
     max_waiting: Count | None
+    remaining_bytes: NonNegativeFloat = 0
 
 
 class SchedulerState(DTO):

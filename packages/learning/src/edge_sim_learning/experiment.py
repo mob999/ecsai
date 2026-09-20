@@ -16,20 +16,21 @@ from time import perf_counter
 import numpy as np
 import torch
 from benchmarl.algorithms import MappoConfig
-from benchmarl.experiment import Experiment, ExperimentConfig
+from benchmarl.experiment import ExperimentConfig
 from benchmarl.experiment.callback import Callback
 from benchmarl.models import MlpConfig
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-from .env import SchedulingEnv
+from .env import ACTION, SchedulingEnv
 from .model import ContextConfig
 from .scenario import build_run
+from .stability import StableExperiment
 from .torch_env import ContentTask
 
 ADAPTATION = (
-    "DEPPO-adapted: four actions, synthetic whole-object workload, "
-    "wired independent access/backhaul, FIFO concurrent pools, LRU, "
+    "DEPPO-adapted v2: five actions, synthetic whole-object workload, "
+    "per-cache shared backhaul/delivery budget, FIFO pools, LRU, "
     "modified team reward; not paper table replication."
 )
 
@@ -43,12 +44,14 @@ def restore_rng_states(payload):
     random.setstate(payload["python_rng"])
 
 
-def evaluate(config, method="local", policy=None, seeds=None):
+def evaluate(config, method="local", policy=None, seeds=None, fixed_ratio=None):
+    if fixed_ratio is not None and not 0.05 <= fixed_ratio <= 0.95:
+        raise ValueError("fixed ratio must be in [0.05, 0.95]")
     torch.set_num_threads(1)
     seeds = list(seeds if seeds is not None else range(1_000_000_000, 1_000_000_010))
     if not seeds:
         raise ValueError("at least one evaluation episode is required")
-    if policy is None and method not in {"random", "local", "forward"}:
+    if policy is None and method not in {"random", "local", "forward", "queue-adaptive"}:
         raise ValueError("learned evaluation requires a policy")
     episodes = []
     if policy is not None:
@@ -81,15 +84,26 @@ def evaluate(config, method="local", policy=None, seeds=None):
                         action = policy(td)["agents", "action"].numpy()
                     inference_s += perf_counter() - inference_start
                 else:
-                    action = (
-                        rng.uniform(-5, 5, (config.clusters, 4)).astype(np.float32)
-                        if method == "random"
-                        else np.tile(
-                            [0, 0, 0, -5 if method == "local" else 5], (config.clusters, 1)
-                        ).astype(np.float32)
-                    )
+                    action = np.tile(
+                        [0, 0, 0, -5 if method == "local" else 5, 0.5], (config.clusters, 1)
+                    ).astype(np.float32)
+                    if method == "random" and fixed_ratio is None:
+                        action[:, 4] = rng.uniform(0.4, 0.6, config.clusters)
+                    if method == "queue-adaptive":
+                        # Same per-request Bernoulli forwarding as Random, only allocation differs.
+                        for i, agent in enumerate(env.possible_agents):
+                            pools = [
+                                p
+                                for p in env.last_view.pools
+                                if env.cache_clusters[p.node_id] == agent
+                            ]
+                            back = sum(p.remaining_bytes for p in pools if p.kind == "backhaul")
+                            total = sum(p.remaining_bytes for p in pools)
+                            action[i, 4] = np.clip(back / total, 0.05, 0.95) if total else 0.5
+                    if fixed_ratio is not None:
+                        action[:, 4] = fixed_ratio
                 actions = dict(zip(env.possible_agents, action, strict=True))
-                if method == "random" and policy is None:
+                if method in {"random", "queue-adaptive"} and policy is None:
                     env.begin(actions, policy="random")
                 obs, _, _, _, _ = env.step(actions)
             truncated_metrics = env.metrics()
@@ -240,15 +254,34 @@ class RunLog(Callback):
             elapsed
             - batch["next", "metrics", "window_wall_s"].squeeze(-1).max(0).values.sum().item(),
         )
+        actions = batch["agents", "action"].detach()
+        for agent in range(self.scenario.clusters):
+            for dim in range(ACTION):
+                x = actions[..., agent, dim]
+                metrics[f"actor_{agent}/action_{dim}_mean"] = x.mean().item()
+                metrics[f"actor_{agent}/action_{dim}_std"] = x.std(unbiased=False).item()
+                low, high = (-5, 5) if dim < 4 else (0.05, 0.95)
+                metrics[f"actor_{agent}/action_{dim}_saturation"] = (
+                    ((x - low < 0.05 * (high - low)) | (high - x < 0.05 * (high - low)))
+                    .float()
+                    .mean()
+                    .item()
+                )
+                for param in ("loc", "scale"):
+                    metrics[f"actor_{agent}/{param}_{dim}"] = (
+                        batch["agents", param][..., agent, dim].mean().item()
+                    )
         self.emit({"train/" + k: v for k, v in metrics.items()})
         self.inference_timer.elapsed = 0.0
         self.train_started = perf_counter()
 
-    def checkpoint(self, name):
+    def checkpoint(self, name, advance_iteration=True):
         exp = self.experiment
         state = exp.state_dict()
-        state["state"]["n_iters_performed"] = exp.n_iters_performed + 1
+        state["state"]["n_iters_performed"] = exp.n_iters_performed + int(advance_iteration)
         payload = {
+            "action_dim": ACTION,
+            "format_version": 2,
             "experiment": state,
             "optimizers": {
                 g: {k: o.state_dict() for k, o in items.items()}
@@ -275,9 +308,13 @@ class RunLog(Callback):
             for k, v in training_td.items(True, True)
             if torch.is_tensor(v)
         }
+        for key in ("actor_updates", "kl_early_stop"):
+            if key in training_td.keys():
+                losses["train/" + key] = training_td[key].float().max().item()
         losses["train/training_wall_s"] = perf_counter() - self.train_started
         self.emit(losses)
         exp = self.experiment
+        self.checkpoint("last.pt")
         if (
             exp.total_frames % self.eval_interval == 0
             or exp.total_frames >= exp.config.max_n_frames
@@ -308,13 +345,14 @@ def train(
     episodes=2048,
     workers=4,
     frames_per_batch=512,
-    epochs=10,
-    minibatch=64,
+    epochs=5,
+    minibatch=512,
     device="cpu",
     mode="offline",
     eval_interval=8192,
     eval_episodes=10,
     resume=None,
+    learning_rate=1e-4,
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -340,7 +378,8 @@ def train(
     cfg = ExperimentConfig.get_from_yaml()
     cfg.sampling_device, cfg.train_device, cfg.buffer_device = "cpu", device, device
     cfg.share_policy_params, cfg.parallel_collection = False, False
-    cfg.lr, cfg.gamma = 3e-4, 0.99
+    cfg.lr, cfg.gamma = learning_rate, 0.99
+    cfg.clip_grad_norm, cfg.clip_grad_val = True, 0.5
     cfg.max_n_frames, cfg.max_n_iters = episodes * scenario.cycles, None
     cfg.on_policy_collected_frames_per_batch = frames_per_batch
     cfg.on_policy_n_envs_per_worker = workers
@@ -350,7 +389,8 @@ def train(
     cfg.evaluation_episodes = 1
     cfg.loggers, cfg.save_folder = ["csv"], str(output)
     algorithm = MappoConfig.get_from_yaml()
-    algorithm.lmbda, algorithm.clip_epsilon, algorithm.share_param_critic = 0.95, 0.2, True
+    algorithm.lmbda, algorithm.clip_epsilon, algorithm.share_param_critic = 0.95, 0.1, True
+    algorithm.entropy_coef = 0.001
     critic = MlpConfig(
         num_cells=[128, 128], layer_class=torch.nn.Linear, activation_class=torch.nn.ReLU
     )
@@ -367,6 +407,8 @@ def train(
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str))
     payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
     if payload:
+        if payload.get("action_dim") != ACTION:
+            raise ValueError("checkpoint action dimension mismatch: v2 requires five actions")
         if payload["scenario"] != scenario.model_dump() or payload["method"] != method:
             raise ValueError("checkpoint scenario/method mismatch")
         if payload.get("workers", workers) != workers or payload["seed"] != seed:
@@ -378,7 +420,7 @@ def train(
         if payload
         else 0
     )
-    experiment = Experiment(
+    experiment = StableExperiment(
         task=ContentTask(scenario, episode_start),
         algorithm_config=algorithm,
         model_config=ContextConfig(use_context=method == "DEPPO-adapted"),
@@ -402,6 +444,7 @@ def train(
                         shutil.copy2(previous_best, output / "best.pt")
             restore_rng_states(payload)
             experiment.collector.update_policy_weights_()
+        callback.checkpoint("last.pt", advance_iteration=False)
         experiment.run()
     finally:
         experiment.close()
