@@ -143,6 +143,9 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
     assert repeated["mean"]["episode_return"] == sampled["mean"]["episode_return"]
     best = torch.load(tmp_path / "first/best.pt", weights_only=False)
     assert best["best"][0] == deterministic["mean"]["success_rate"]
+    sampled_best = torch.load(tmp_path / "first/best-stochastic.pt", weights_only=False)
+    assert sampled_best["best_stochastic"][0] == sampled["mean"]["success_rate"]
+    assert sampled_best["best_stochastic"][1] == -sampled["mean"]["mean_latency_s"]
     actor = next(m for m in payload["policy"].modules() if isinstance(m, ContextModel))
     assert len(actor.actors) == 2
     from tensordict import TensorDict
@@ -187,6 +190,8 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
     restored = torch.load(tmp_path / "restored" / "last.pt", weights_only=False)
     assert restored["experiment"]["state"]["total_frames"] == 32
     assert (tmp_path / "restored" / "best.pt").exists()
+    assert (tmp_path / "restored" / "best-stochastic.pt").exists()
+    assert restored["best_stochastic"] >= sampled_best["best_stochastic"]
     assert any(
         not torch.equal(v, restored["experiment"]["loss_agents"][k])
         for k, v in loss.items()

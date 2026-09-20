@@ -216,6 +216,7 @@ class RunLog(Callback):
         self.mode, self.eval_interval, self.eval_episodes = mode, eval_interval, eval_episodes
         self.eval_stochastic = eval_stochastic
         self.best = (-1.0, float("-inf"))
+        self.best_stochastic = (-1.0, float("-inf"))
 
     def on_setup(self):
         import wandb
@@ -319,6 +320,7 @@ class RunLog(Callback):
             "method": self.method,
             "seed": self.seed,
             "best": self.best,
+            "best_stochastic": self.best_stochastic,
             "workers": exp.config.on_policy_n_envs_per_worker,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -372,6 +374,12 @@ class RunLog(Callback):
                 (Path(self.output) / f"evaluation-stochastic-{exp.total_frames}.json").write_text(
                     json.dumps(sampled, indent=2)
                 )
+                sampled_score = (
+                    sampled["mean"]["success_rate"], -sampled["mean"]["mean_latency_s"]
+                )
+                if sampled_score > self.best_stochastic:
+                    self.best_stochastic = sampled_score
+                    self.checkpoint("best-stochastic.pt")
         self.checkpoint("last.pt")
         self.collection_started = perf_counter()
 
@@ -506,13 +514,14 @@ def train(
             for g, items in experiment.optimizers.items():
                 for k, optimizer in items.items():
                     optimizer.load_state_dict(payload["optimizers"][g][k])
-            previous_best = Path(resume).resolve().parent / "best.pt"
-            if previous_best.exists():
-                best_payload = torch.load(previous_best, map_location="cpu", weights_only=False)
-                if best_payload["best"] == payload["best"]:
-                    callback.best = payload["best"]
-                    if previous_best != output / "best.pt":
-                        shutil.copy2(previous_best, output / "best.pt")
+            for field, filename in (("best", "best.pt"), ("best_stochastic", "best-stochastic.pt")):
+                previous_best = Path(resume).resolve().parent / filename
+                if field in payload and previous_best.exists():
+                    best_payload = torch.load(previous_best, map_location="cpu", weights_only=False)
+                    if best_payload.get(field) == payload[field]:
+                        setattr(callback, field, payload[field])
+                        if previous_best != output / filename:
+                            shutil.copy2(previous_best, output / filename)
             restore_rng_states(payload)
             experiment.collector.update_policy_weights_()
         callback.checkpoint("last.pt", advance_iteration=False)

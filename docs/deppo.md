@@ -103,3 +103,11 @@ This distinction matters for DEPPO: taking the policy's deterministic continuous
 parameters and then thresholding the forwarding score can behave very differently
 from sampling parameters as during PPO collection. Compare both curves explicitly;
 a good sampled score does not establish deterministic deployment performance.
+
+When sampled validation is enabled, `best-stochastic.pt` separately retains the
+highest sampled validation success rate (ties prefer lower mean latency).
+`best.pt` continues to select deterministic performance. Both scores and both
+available selected checkpoints survive resume. Older checkpoints without a
+sampled best score remain loadable; sampled selection starts at the next
+validation, and cannot reconstruct models from earlier logged scores. Evaluate
+each checkpoint with its corresponding `--exploration` mode and report that mode.
