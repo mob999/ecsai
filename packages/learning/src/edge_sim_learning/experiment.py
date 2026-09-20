@@ -44,7 +44,12 @@ def restore_rng_states(payload):
     random.setstate(payload["python_rng"])
 
 
-def evaluate(config, method="local", policy=None, seeds=None, fixed_ratio=None):
+@torch.random.fork_rng(devices=[])
+def evaluate(
+    config, method="local", policy=None, seeds=None, fixed_ratio=None, exploration="deterministic"
+):
+    if exploration not in {"deterministic", "stochastic"}:
+        raise ValueError("unknown exploration mode")
     if fixed_ratio is not None and not 0.05 <= fixed_ratio <= 0.95:
         raise ValueError("fixed ratio must be in [0.05, 0.95]")
     torch.set_num_threads(1)
@@ -57,6 +62,8 @@ def evaluate(config, method="local", policy=None, seeds=None, fixed_ratio=None):
     if policy is not None:
         policy = copy.deepcopy(policy).cpu().eval()
     for seed in seeds:
+        if exploration == "stochastic":
+            torch.manual_seed(seed)
         env = SchedulingEnv(config, evaluation=True)
         started = perf_counter()
         inference_s = 0
@@ -80,7 +87,14 @@ def evaluate(config, method="local", policy=None, seeds=None, fixed_ratio=None):
                         [],
                     )
                     inference_start = perf_counter()
-                    with torch.no_grad(), set_exploration_type(ExplorationType.DETERMINISTIC):
+                    with (
+                        torch.no_grad(),
+                        set_exploration_type(
+                            ExplorationType.DETERMINISTIC
+                            if exploration == "deterministic"
+                            else ExplorationType.RANDOM
+                        ),
+                    ):
                         action = policy(td)["agents", "action"].numpy()
                     inference_s += perf_counter() - inference_start
                 else:
@@ -126,7 +140,14 @@ def evaluate(config, method="local", policy=None, seeds=None, fixed_ratio=None):
         for key in episodes[0]
         if key not in {"seed", "workload"}
     }
-    return {"method": method, "seeds": seeds, "mean": means, "episodes": episodes}
+    return {
+        "method": method,
+        "exploration": exploration,
+        "fixed_ratio": fixed_ratio,
+        "seeds": seeds,
+        "mean": means,
+        "episodes": episodes,
+    }
 
 
 def metadata(config, seed, method):

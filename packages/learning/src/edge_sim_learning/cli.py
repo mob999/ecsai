@@ -37,6 +37,9 @@ def main():
     p.add_argument(
         "--method", choices=["random", "local", "forward", "queue-adaptive"], default="local"
     )
+    p.add_argument(
+        "--exploration", choices=["deterministic", "stochastic"], default="deterministic"
+    )
     p.add_argument("--fixed-ratio", type=float)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
     p.add_argument("--checkpoint", type=Path)
@@ -100,6 +103,7 @@ def main():
             policy,
             range(base_seed + args.seed, base_seed + args.seed + args.episodes),
             fixed_ratio=args.fixed_ratio,
+            exploration=args.exploration,
         )
         (args.output / "evaluation.json").write_text(json.dumps(result, indent=2))
         save_report(args.output, config, args.seed, method, args.wandb_mode, [result["mean"]])
