@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class ScenarioConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    scheduler_release: Literal["continuous", "window"] = "continuous"
     bandwidth_mode: Literal["independent", "shared"] = "shared"
     capacity_profile: Literal["calibrated", "paper-audit"] = "calibrated"
     delivery_load: float = Field(default=0.75, gt=0)
@@ -204,6 +205,7 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         ),
         content=ContentServiceSpec(
             origin="origin",
+            scheduler_release=config.scheduler_release,
             bandwidth_mode=config.bandwidth_mode,
             coalesce_backhaul=config.coalesce_backhaul,
             schedulers=schedulers,

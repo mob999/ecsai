@@ -24,7 +24,7 @@ from benchmarl.models import MlpConfig
 from tensordict import TensorDict
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 
-from .env import ACTION, SchedulingEnv
+from .env import ACTION, OBS, SchedulingEnv
 from .model import ContextConfig
 from .scenario import build_run
 from .stability import StableExperiment
@@ -111,39 +111,47 @@ def _evaluate_serial(
     for seed in seeds:
         if exploration == "stochastic":
             torch.manual_seed(seed)
-        env = SchedulingEnv(config, evaluation=True)
+        env = SchedulingEnv(config, evaluation=True, method=method)
         started = perf_counter()
         inference_s = 0
+        inference_calls = 0
         try:
             obs, _ = env.reset(seed=seed)
             rng = np.random.default_rng(np.random.SeedSequence([seed, 777]))
+
+            def infer(observations, env=env):
+                nonlocal inference_s, inference_calls
+                td = TensorDict(
+                    {
+                        "agents": TensorDict(
+                            {
+                                "observation": torch.tensor(
+                                    np.stack([observations[a] for a in env.possible_agents])
+                                )
+                            },
+                            [config.clusters],
+                        ),
+                        "state": torch.tensor(env.state()),
+                    },
+                    [],
+                )
+                inference_start = perf_counter()
+                with (
+                    torch.no_grad(),
+                    set_exploration_type(
+                        ExplorationType.DETERMINISTIC
+                        if exploration == "deterministic"
+                        else ExplorationType.RANDOM
+                    ),
+                ):
+                    action = policy(td)["agents", "action"].numpy()
+                inference_s += perf_counter() - inference_start
+                inference_calls += 1
+                return dict(zip(env.possible_agents, action, strict=True))
+
             while env.agents:
                 if policy is not None:
-                    td = TensorDict(
-                        {
-                            "agents": TensorDict(
-                                {
-                                    "observation": torch.tensor(
-                                        np.stack([obs[a] for a in env.possible_agents])
-                                    )
-                                },
-                                [config.clusters],
-                            ),
-                            "state": torch.tensor(env.state()),
-                        },
-                        [],
-                    )
-                    inference_start = perf_counter()
-                    with (
-                        torch.no_grad(),
-                        set_exploration_type(
-                            ExplorationType.DETERMINISTIC
-                            if exploration == "deterministic"
-                            else ExplorationType.RANDOM
-                        ),
-                    ):
-                        action = policy(td)["agents", "action"].numpy()
-                    inference_s += perf_counter() - inference_start
+                    action = np.stack(list(infer(obs).values()))
                 else:
                     action = np.tile(
                         [0, 0, 0, -5 if method == "local" else 5, 0.5], (config.clusters, 1)
@@ -168,7 +176,7 @@ def _evaluate_serial(
                     env.begin(actions, policy="random")
                 obs, _, _, _, _ = env.step(actions)
             truncated_metrics = env.metrics()
-            metrics = env.drain()
+            metrics = env.drain(infer if policy is not None else None)
             episodes.append(
                 metrics
                 | {
@@ -179,6 +187,8 @@ def _evaluate_serial(
                     "unfinished_at_truncation": truncated_metrics["unfinished"],
                     "wall_s": perf_counter() - started,
                     "inference_wall_s": inference_s,
+                    "policy_joint_calls": inference_calls,
+                    "policy_agent_calls": inference_calls * config.clusters,
                 }
             )
         finally:
@@ -219,7 +229,13 @@ def metadata(config, seed, method):
         "scenario": config.model_dump(),
         "seed": seed,
         "method": method,
-        "adaptation": ADAPTATION,
+        "adaptation": (
+            "DD-adapted: fixed FIFO request slots, padded local request features, "
+            "bounded per-request scores thresholded at zero plus bandwidth ratio; "
+            "window release, MAPPO training, no GRU; not exact original DD reproduction."
+            if method == "DD-adapted"
+            else ADAPTATION
+        ),
         "code_revision": code,
         "source_sha256": source_hash.hexdigest(),
         "working_tree_dirty": dirty,
@@ -343,11 +359,15 @@ class RunLog(Callback):
         )
         actions = batch["agents", "action"].detach()
         for agent in range(self.scenario.clusters):
-            for dim in range(ACTION):
+            for dim in range(actions.shape[-1]):
                 x = actions[..., agent, dim]
                 metrics[f"actor_{agent}/action_{dim}_mean"] = x.mean().item()
                 metrics[f"actor_{agent}/action_{dim}_std"] = x.std(unbiased=False).item()
-                low, high = (-5, 5) if dim < 4 else (0.05, 0.95)
+                low, high = (
+                    (0.05, 0.95)
+                    if dim == actions.shape[-1] - 1
+                    else ((-1, 1) if self.method == "DD-adapted" else (-5, 5))
+                )
                 metrics[f"actor_{agent}/action_{dim}_saturation"] = (
                     ((x - low < 0.05 * (high - low)) | (high - x < 0.05 * (high - low)))
                     .float()
@@ -368,7 +388,9 @@ class RunLog(Callback):
         state["state"]["n_iters_performed"] = exp.n_iters_performed + int(advance_iteration)
         payload = {
             "training_options": self.training_options,
-            "action_dim": ACTION,
+            "action_dim": self.scenario.scheduler_capacity + 2
+            if self.method == "DD-adapted"
+            else ACTION,
             "format_version": 2,
             "experiment": state,
             "optimizers": {
@@ -496,8 +518,11 @@ def train(
         < 1
     ):
         raise ValueError("training counts must be positive")
-    if method not in {"DEPPO-adapted", "MAPPO-no-context"}:
+    if method not in {"DEPPO-adapted", "MAPPO-no-context", "DD-adapted"}:
         raise ValueError("unknown learning method")
+    if method == "DD-adapted":
+        scenario = scenario.model_copy(update={"scheduler_release": "window"})
+    action_dim = scenario.scheduler_capacity + 2 if method == "DD-adapted" else ACTION
     if device == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA training requires an available NVIDIA GPU")
     if episodes * scenario.cycles % frames_per_batch or frames_per_batch % (
@@ -567,8 +592,8 @@ def train(
         legacy = dict(normalize_advantage=False, hidden_size=128, context_size=64, initial_std=None)
         if payload.get("training_options", legacy) != training_options:
             raise ValueError("checkpoint training options mismatch")
-        if payload.get("action_dim") != ACTION:
-            raise ValueError("checkpoint action dimension mismatch: v2 requires five actions")
+        if payload.get("action_dim") != action_dim:
+            raise ValueError("checkpoint action dimension mismatch")
         if (
             type(scenario).model_validate(payload["scenario"]) != scenario
             or payload["method"] != method
@@ -584,10 +609,13 @@ def train(
         else 0
     )
     experiment = StableExperiment(
-        task=ContentTask(scenario, episode_start),
+        task=ContentTask(scenario, episode_start, method),
         algorithm_config=algorithm,
         model_config=ContextConfig(
             use_context=method == "DEPPO-adapted",
+            input_dim=OBS + 4 * (scenario.scheduler_capacity + 1)
+            if method == "DD-adapted"
+            else OBS,
             hidden_size=hidden_size,
             context_size=context_size,
             initial_std=initial_std,

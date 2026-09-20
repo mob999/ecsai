@@ -18,13 +18,15 @@ class HistoryActor(nn.Module):
         hidden_size=128,
         context_size=64,
         initial_std=None,
+        input_dim=OBS,
     ):
         super().__init__()
         self.use_context = use_context
+        self.input_dim = input_dim
         if use_context:
             self.gru = nn.GRU(OBS + ACTION, context_size, batch_first=True)
         self.mlp = nn.Sequential(
-            nn.Linear(OBS + (context_size if use_context else 0), hidden_size),
+            nn.Linear(input_dim + (context_size if use_context else 0), hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -41,7 +43,8 @@ class HistoryActor(nn.Module):
                 self.mlp[-1].bias[output_dim // 2 :].fill_(raw)
 
     def forward(self, features):
-        current = features[..., :OBS]
+        input_dim = getattr(self, "input_dim", OBS)
+        current = features[..., :input_dim]
         if self.use_context:
             history = features[..., OBS:-1].reshape(-1, HISTORY, OBS + ACTION)
             length = features[..., -1].reshape(-1).long().clamp(0, HISTORY)
@@ -54,6 +57,13 @@ class HistoryActor(nn.Module):
                 (current, context.reshape(*features.shape[:-1], self.gru.hidden_size)), -1
             )
         raw = self.mlp(current)
+        if input_dim != OBS:
+            slots = features[..., OBS:].reshape(*features.shape[:-1], -1, 4)
+            valid = (slots[..., 3] > 0) & (slots[..., 2] == 0)
+            mask = torch.cat((valid, torch.ones_like(valid[..., :1])), -1)
+            # Padding/forwarded slots have a fixed distribution: zero policy gradient
+            # and zero KL, with identical factors cancelling in PPO likelihood ratios.
+            raw = torch.where(torch.cat((mask, mask), -1), raw, torch.zeros_like(raw))
         loc, raw_scale = raw.chunk(2, dim=-1)
         # BenchMARL applies biased_softplus_1.0 to the second half.
         # Bound pre-tanh means and keep standard deviations in a finite useful range.
@@ -62,7 +72,13 @@ class HistoryActor(nn.Module):
 
 class ContextModel(Model):
     def __init__(
-        self, use_context=True, hidden_size=128, context_size=64, initial_std=None, **kwargs
+        self,
+        use_context=True,
+        hidden_size=128,
+        context_size=64,
+        initial_std=None,
+        input_dim=OBS,
+        **kwargs,
     ):
         super().__init__(**kwargs)
         if self.centralised or self.share_params or not self.input_has_agent_dim:
@@ -75,6 +91,7 @@ class ContextModel(Model):
                     hidden_size,
                     context_size,
                     initial_std,
+                    input_dim,
                 )
                 for _ in range(self.n_agents)
             ]
@@ -94,6 +111,7 @@ class ContextConfig(ModelConfig):
     hidden_size: int = 128
     context_size: int = 64
     initial_std: float | None = None
+    input_dim: int = OBS
 
     @staticmethod
     def associated_class():

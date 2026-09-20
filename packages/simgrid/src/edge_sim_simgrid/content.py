@@ -162,14 +162,25 @@ class ContentRuntime:
         ]
         return sum(values) / len(values)
 
+    def _eligible(self, rid):
+        return (
+            self.spec.scheduler_release == "continuous"
+            or self.requests[rid].forwarded
+            or rid in self.window_requests
+        )
+
     def _enqueue(self, rid, cluster):
         request = self.requests[rid]
         request.cluster = cluster
-        if cluster not in self.busy and self.queues[cluster]:
+        if (
+            cluster not in self.busy
+            and self.queues[cluster]
+            and self._eligible(self.queues[cluster][0])
+        ):
             waiting = self.queues[cluster].popleft()
             self.busy[cluster] = (waiting, self.now + self.schedulers[cluster].service_s)
             self.requests[waiting].status = "SCHEDULING"
-        if cluster not in self.busy and not self.queues[cluster]:
+        if cluster not in self.busy and not self.queues[cluster] and self._eligible(rid):
             self.busy[cluster] = (rid, self.now + self.schedulers[cluster].service_s)
             request.status = "SCHEDULING"
         elif len(self.queues[cluster]) < self.schedulers[cluster].max_waiting:
@@ -190,7 +201,9 @@ class ContentRuntime:
         )
         # sigmoid(logit) >= .5 is exactly logit >= 0; avoids overflow.
         forward = sum(a * b for a, b in zip(w[:3], x, strict=True)) + w[3] >= 0
-        if self.control.policy != "threshold":
+        if self.control.policy == "direct":
+            forward = False if request.forwarded else self.direct_decisions[rid]
+        elif self.control.policy != "threshold":
             forward = {"local": False, "forward": True, "random": self.rng.random() < 0.5}[
                 self.control.policy
             ]
@@ -465,7 +478,7 @@ class ContentRuntime:
                 else:
                     self._enqueue(spec.id, spec.cluster_id)
         for cluster, queue in self.queues.items():
-            if queue and cluster not in self.busy:
+            if queue and cluster not in self.busy and self._eligible(queue[0]):
                 rid = queue.popleft()
                 self.busy[cluster] = rid, self.now + self.schedulers[cluster].service_s
                 self.requests[rid].status = "SCHEDULING"
@@ -500,6 +513,24 @@ class ContentRuntime:
             until_s = min(until_s, self.run.until_s)
             if until_s <= self.now:
                 raise CommandError("finished", "run time limit reached")
+        if control.policy == "direct":
+            if self.spec.scheduler_release != "window":
+                raise CommandError("invalid_control", "direct decisions require window release")
+            for item in control.schedulers:
+                expected = set(self.queues[item.cluster_id])
+                if item.cluster_id in self.busy:
+                    expected.add(self.busy[item.cluster_id][0])
+                expected = {rid for rid in expected if not self.requests[rid].forwarded}
+                if set(item.request_decisions) != expected:
+                    raise CommandError(
+                        "invalid_control", "direct decisions must cover visible requests"
+                    )
+        self.window_requests = set(self.live)
+        self.direct_decisions = {
+            rid: forward
+            for item in control.schedulers
+            for rid, forward in item.request_decisions.items()
+        }
         self._set_bandwidth(control)
         self.control = control
         self.control_weights = {c.cluster_id: c.weights for c in control.schedulers}
@@ -557,6 +588,8 @@ class ContentRuntime:
         selected = self.live | self.changed if selection is None else set(selection)
         if scope == "scheduling":
             selected = {rid for queue in self.queues.values() for rid in queue}
+            if self.spec.scheduler_release == "window":
+                selected.update(rid for rid, _ in self.busy.values())
         if selected - self.requests.keys():
             raise CommandError("unknown_request", "unknown content request")
         return ContentView(

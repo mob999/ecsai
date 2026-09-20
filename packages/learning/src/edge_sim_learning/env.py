@@ -20,8 +20,16 @@ FEATURES = OBS + HISTORY * (OBS + ACTION) + 1
 class SchedulingEnv(ParallelEnv):
     metadata = {"name": "edge_content_v1", "render_modes": [], "is_parallelizable": True}
 
-    def __init__(self, config=None, seed=0, runner=None, slot=0, evaluation=False):
+    def __init__(
+        self, config=None, seed=0, runner=None, slot=0, evaluation=False, method="DEPPO-adapted"
+    ):
         self.config = config or ScenarioConfig()
+        self.method = method
+        self.direct = method == "DD-adapted"
+        if self.direct and self.config.scheduler_release != "window":
+            raise ValueError("DD-adapted requires scheduler_release=window")
+        self.slots = self.config.scheduler_capacity + 1
+        self.action_dim = self.slots + 1 if self.direct else ACTION
         self.possible_agents = [f"cluster-{i}" for i in range(self.config.clusters)]
         self.agents = []
         self.runner, self.slot, self.seed_value = runner, slot, seed
@@ -38,6 +46,13 @@ class SchedulingEnv(ParallelEnv):
             np.array([5] * 4 + [0.95], np.float32),
             dtype=np.float32,
         )
+
+        if self.direct:
+            self._observation_space = Box(-np.inf, np.inf, (OBS + self.slots * 4,), np.float32)
+            self._action_space = Box(
+                np.array([-1] * self.slots + [0.05], np.float32),
+                np.array([1] * self.slots + [0.95], np.float32),
+            )
 
     def observation_space(self, agent):
         return self._observation_space
@@ -99,7 +114,32 @@ class SchedulingEnv(ParallelEnv):
     def state(self):
         return np.concatenate([self.current[a] for a in self.possible_agents]).astype(np.float32)
 
+    def _request_slots(self):
+        requests = {r.request_id: r for r in self.last_view.requests}
+        slots = {}
+        for scheduler in self.last_view.schedulers:
+            ids = ([scheduler.active_request] if scheduler.active_request else []) + list(
+                scheduler.waiting
+            )
+            slots[scheduler.cluster_id] = [requests[rid] for rid in ids]
+        return slots
+
     def _observations(self):
+        if self.direct:
+            result = {}
+            for agent, requests in self._request_slots().items():
+                features = np.zeros((self.slots, 4), np.float32)
+                for i, r in enumerate(requests):
+                    features[i] = (
+                        min(1, r.size_bytes / self.config.max_size),
+                        np.clip(
+                            (r.deadline_s - self.last_view.now_s) / self.config.deadline_s, 0, 1
+                        ),
+                        float(r.forwarded),
+                        1,
+                    )
+                result[agent] = np.concatenate((self.current[agent], features.ravel()))
+            return result
         result = {}
         for a in self.possible_agents:
             value = np.zeros(FEATURES, np.float32)
@@ -161,6 +201,25 @@ class SchedulingEnv(ParallelEnv):
         for a, action in actions.items():
             if not self.action_space(a).contains(np.asarray(action, dtype=np.float32)):
                 raise ValueError(f"invalid action for {a}")
+        if self.direct:
+            if policy != "threshold":
+                raise ValueError("DD-adapted uses explicit per-request decisions")
+            slots = self._request_slots()
+            return WindowControl(
+                policy="direct",
+                schedulers=tuple(
+                    SchedulerControl(
+                        cluster_id=a,
+                        backhaul_ratio=float(actions[a][-1]),
+                        request_decisions={
+                            r.request_id: bool(actions[a][i] >= 0)
+                            for i, r in enumerate(slots[a])
+                            if not r.forwarded
+                        },
+                    )
+                    for a in self.possible_agents
+                ),
+            )
         return WindowControl(
             policy=policy,
             schedulers=tuple(
@@ -202,7 +261,7 @@ class SchedulingEnv(ParallelEnv):
         response, self.response = self.response, None
         encoding_started = perf_counter()
         wall = (self.response_received or encoding_started) - self.step_started
-        for a in self.agents:
+        for a in [] if self.direct else self.agents:
             self.history[a].append(np.concatenate((self.current[a], self.pending_actions[a])))
         self.cycle += 1
         self.last_view = response.view
@@ -248,16 +307,30 @@ class SchedulingEnv(ParallelEnv):
             self.agents = []
         return observations, rewards, terminated, truncated, infos
 
-    def drain(self):
-        """Evaluation only: no new arrivals, fixed last control, no extra learner steps."""
+    def drain(self, action_fn=None):
+        """Drain without learner steps; batch policies decide newly visible requests."""
         limit = self.config.horizon_s + self.config.deadline_s
         while self.elapsed < limit:
+            if self.direct and action_fn is None:
+                raise ValueError("DD drain requires policy inference for newly visible requests")
+            if self.config.scheduler_release == "window" and action_fn is not None:
+                # No training transition or reward is added during evaluation drain.
+                live_agents, self.agents = self.agents, self.possible_agents.copy()
+                try:
+                    actions = action_fn(self._observations())
+                    self.pending_control = self.control(actions)
+                    if not self.direct:
+                        for a in self.possible_agents:
+                            self.history[a].append(np.concatenate((self.current[a], actions[a])))
+                finally:
+                    self.agents = live_agents
             response = self.session.advance_window(
                 min(limit, self.elapsed + self.config.period_s),
                 self.pending_control,
                 scope="scheduling",
             )
             self.last_view = response.view
+            self._encode(response.view)
             self.elapsed = response.view.now_s
             self.latencies.extend(response.view.latencies_s)
             if response.kind == "finished":

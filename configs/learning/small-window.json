@@ -1,0 +1,7 @@
+{
+  "clusters": 3,
+  "caches": 10,
+  "request_rate": 300,
+  "scheduler_release": "window",
+  "scheduler_capacity": 100
+}

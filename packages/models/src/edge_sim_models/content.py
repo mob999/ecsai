@@ -47,6 +47,7 @@ class ContentServiceSpec(DTO):
     origin: Identifier
     bandwidth_mode: Literal["independent", "shared"] = "independent"
     coalesce_backhaul: bool = True
+    scheduler_release: Literal["continuous", "window"] = "continuous"
     schedulers: tuple[SchedulerSpec, ...]
     caches: tuple[CacheNodeSpec, ...]
     requests: tuple[ContentRequest, ...]
@@ -81,6 +82,8 @@ class ContentServiceSpec(DTO):
 
 
 class SchedulerControl(DTO):
+    # Request IDs bind decisions to a boundary snapshot, never to future arrivals.
+    request_decisions: dict[Identifier, bool] = Field(default_factory=dict)
     backhaul_ratio: Annotated[float, Field(ge=0.05, le=0.95, allow_inf_nan=False)] = 0.5
     cluster_id: Identifier
     weights: tuple[
@@ -93,7 +96,7 @@ class SchedulerControl(DTO):
 
 class WindowControl(DTO):
     schedulers: tuple[SchedulerControl, ...]
-    policy: Literal["threshold", "local", "forward", "random"] = "threshold"
+    policy: Literal["threshold", "local", "forward", "random", "direct"] = "threshold"
 
     @model_validator(mode="after")
     def unique(self) -> Self:
@@ -163,7 +166,8 @@ class LinkCounter(DTO):
 
 class ContentView(DTO):
     # Scheduling snapshots retain all counters/pools but include only queued
-    # scheduler requests and omit transfer details. inspect() remains full.
+    # scheduler requests and omit transfer details. Window-release snapshots also
+    # include the active scheduler request for fixed-slot control. inspect() remains full.
     scope: Literal["full", "scheduling"] = "full"
     now_s: Seconds
     schedulers: tuple[SchedulerState, ...] = ()

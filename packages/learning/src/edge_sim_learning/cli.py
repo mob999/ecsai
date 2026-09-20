@@ -17,7 +17,9 @@ def main():
         p.add_argument("--wandb-mode", choices=["offline", "online"], required=True)
     p = sub.choices["train"]
     p.add_argument(
-        "--method", choices=["DEPPO-adapted", "MAPPO-no-context"], default="DEPPO-adapted"
+        "--method",
+        choices=["DEPPO-adapted", "MAPPO-no-context", "DD-adapted"],
+        default="DEPPO-adapted",
     )
     p.add_argument("--episodes", type=int, default=2048)
     p.add_argument("--workers", type=int, default=4)
@@ -98,8 +100,13 @@ def main():
             import torch
 
             payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-            if payload.get("action_dim") != 5:
-                raise ValueError("v2 evaluation requires a five-action checkpoint")
+            expected_dim = (
+                payload["scenario"]["scheduler_capacity"] + 2
+                if payload["method"] == "DD-adapted"
+                else 5
+            )
+            if payload.get("action_dim") != expected_dim:
+                raise ValueError("checkpoint action dimension mismatch")
             config, policy, method = (
                 ScenarioConfig(**payload["scenario"]),
                 payload["policy"],

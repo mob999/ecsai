@@ -122,3 +122,9 @@ each checkpoint with its corresponding `--exploration` mode and report that mode
 `eval/evaluation_wall_s` 与 `eval_stochastic/evaluation_wall_s` 记录包含
 进程启动及回收的整批实际耗时；原有 `wall_s` 是单 episode 耗时均值。
 多实验同时运行时应按总 CPU 数限制验证并行度。
+
+### DD 固定请求维度基线
+
+`train --method DD-adapted` 使用固定请求槽位直接输出本地/转发决策及带宽比例。
+它与无 GRU 的阈值策略不同。实现差异、匹配批量时序的对照配置和运行命令见
+[DD-adapted 基线说明](dd-baseline.md)。

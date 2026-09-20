@@ -14,11 +14,12 @@ from .scenario import ScenarioConfig
 
 
 class ContentBatchEnv(EnvBase):
-    def __init__(self, config, workers=4, seed=0, episode_start=0):
+    def __init__(self, config, workers=4, seed=0, episode_start=0, method="DEPPO-adapted"):
         super().__init__(device="cpu", batch_size=[workers])
         self.runner = BatchRunner(workers=workers)
         self.envs = [
-            SchedulingEnv(config, seed=seed, runner=self.runner, slot=i) for i in range(workers)
+            SchedulingEnv(config, seed=seed, runner=self.runner, slot=i, method=method)
+            for i in range(workers)
         ]
         for env in self.envs:
             env.generation = episode_start
@@ -116,7 +117,8 @@ class ContentBatchEnv(EnvBase):
 
 
 class ContentTask(TaskClass):
-    def __init__(self, config, episode_start=0):
+    def __init__(self, config, episode_start=0, method="DEPPO-adapted"):
+        self.method = method
         self.episode_start = episode_start
         super().__init__("content", config.model_dump())
 
@@ -124,7 +126,7 @@ class ContentTask(TaskClass):
         if str(device) != "cpu":
             raise ValueError("SimGrid sampling must use CPU")
         return lambda: ContentBatchEnv(
-            ScenarioConfig(**self.config), num_envs, seed, self.episode_start
+            ScenarioConfig(**self.config), num_envs, seed, self.episode_start, self.method
         )
 
     def supports_continuous_actions(self):
