@@ -290,6 +290,26 @@ class PolicySpec(DTO):
         return self
 
 
+# Content contracts depend only on the primitive DTO types defined above.
+from .content import (  # noqa: E402
+    CacheNodeSpec,
+    ContentRequest,
+    ContentRequestState,
+    ContentServiceSpec,
+    ContentTransferState,
+    ContentView,
+    LinkCounter,
+    PoolState,
+    SchedulerControl,
+    SchedulerSpec,
+    SchedulerState,
+    Serve,
+    TransferPoolSpec,
+    WindowControl,
+    WindowResult,
+)
+
+
 class RunSpec(DTO):
     scenario: ScenarioSpec
     seed: Annotated[int, Field(ge=0, strict=True)] = 0
@@ -298,6 +318,8 @@ class RunSpec(DTO):
     trace: bool = True
     policy: PolicySpec = Field(default_factory=PolicySpec)
     external: bool = False
+    control_mode: Literal["event", "window"] = "event"
+    content: ContentServiceSpec | None = None
     pause_overhead_s: Seconds = 0
     resume_overhead_s: Seconds = 0
 
@@ -305,6 +327,37 @@ class RunSpec(DTO):
     def unify_external_mode(self) -> Self:
         if self.policy.external and not self.external:
             object.__setattr__(self, "external", True)
+        if (self.control_mode == "window") != (self.content is not None):
+            raise ValueError("window mode requires content service, event mode forbids it")
+        if self.content is not None:
+            if self.external or self.policy.plugins or self.scenario.requests:
+                raise ValueError(
+                    "window control cannot mix with external/event policies or requests"
+                )
+            nodes = {n.id for n in self.scenario.nodes}
+            links = {link.id for link in self.scenario.links}
+            artifacts = {a.id: a for a in self.scenario.artifacts}
+            routes = {(r.src, r.dst): r.links for r in self.scenario.routes}
+            if self.content.origin not in nodes:
+                raise ValueError("unknown origin")
+            for cache in self.content.caches:
+                if cache.node_id not in nodes or cache.node_id == self.content.origin:
+                    raise ValueError("invalid cache node")
+                if cache.backhaul_link not in links or cache.delivery_link not in links:
+                    raise ValueError("unknown content link")
+                if cache.backhaul_link not in routes.get((self.content.origin, cache.node_id), ()):
+                    raise ValueError("missing backhaul route")
+                for receiver in {r.receiver for r in self.content.requests}:
+                    if cache.delivery_link not in routes.get((cache.node_id, receiver), ()):
+                        raise ValueError("missing delivery route")
+            for request in self.content.requests:
+                a = artifacts.get(request.artifact_id)
+                if request.receiver not in nodes or a is None:
+                    raise ValueError("unknown content request reference")
+                if a.size_bytes == 0 or a.locations != (self.content.origin,):
+                    raise ValueError(
+                        "content objects must have positive size and start only at origin"
+                    )
         return self
 
 
@@ -560,6 +613,21 @@ def validate(scenario: ScenarioSpec | dict) -> ScenarioSpec:
 
 
 __all__ = [
+    "CacheNodeSpec",
+    "ContentRequest",
+    "ContentRequestState",
+    "ContentServiceSpec",
+    "ContentTransferState",
+    "ContentView",
+    "LinkCounter",
+    "PoolState",
+    "SchedulerControl",
+    "SchedulerSpec",
+    "SchedulerState",
+    "Serve",
+    "TransferPoolSpec",
+    "WindowControl",
+    "WindowResult",
     "AdvanceResult",
     "ArtifactId",
     "ArtifactSpec",

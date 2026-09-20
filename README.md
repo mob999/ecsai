@@ -52,6 +52,13 @@ uv run --locked python -I -c 'import simgrid; print(simgrid.simgrid_version, sim
 Run all commands below from the repository root. Scripts that create sessions
 must use `if __name__ == "__main__":` because workers use multiprocessing spawn.
 
+## DEPPO / BenchMARL learning
+
+The optional `edge-sim-learning` package provides periodic content-service simulation,
+DEPPO-adapted / MAPPO-no-context training, drained evaluation and W&B logging.
+See [the experiment guide](docs/deppo.md) for CPU smoke, Linux CUDA training,
+three-seed validation and the paper-to-implementation differences.
+
 ## Examples
 
 ```sh

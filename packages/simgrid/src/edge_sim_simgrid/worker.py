@@ -11,6 +11,7 @@ def worker_main(connection, run_spec):
     try:
         import simgrid
 
+        from .content import ContentRuntime
         from .platform import platform_xml
         from .resources import CommandError
         from .runtime import Runtime
@@ -24,7 +25,9 @@ def worker_main(connection, run_spec):
             engine.load_platform(str(platform))
 
             def controller():
-                runtime = Runtime(run_spec)
+                runtime = (ContentRuntime if run_spec.control_mode == "window" else Runtime)(
+                    run_spec
+                )
                 connection.send(("ready", None))
                 try:
                     while True:
@@ -33,7 +36,17 @@ def worker_main(connection, run_spec):
                             if op == "close":
                                 runtime.close()
                                 break
-                            if op == "advance":
+                            if op == "advance_window":
+                                if run_spec.control_mode != "window":
+                                    raise CommandError(
+                                        "wrong_mode", "advance_window requires window mode"
+                                    )
+                                value = runtime.advance_window(*payload)
+                            elif op in {"advance", "apply"} and run_spec.control_mode == "window":
+                                raise CommandError(
+                                    "wrong_mode", "window runs require advance_window"
+                                )
+                            elif op == "advance":
                                 value = runtime.advance(payload)
                             elif op == "apply":
                                 value = runtime.apply(*payload)

@@ -13,12 +13,15 @@ from .settings import Settings
 if TYPE_CHECKING:
     from edge_sim_models import (
         AdvanceResult,
+        ContentView,
         DecisionCommand,
         DomainEvent,
         RunResult,
         RunSpec,
         ScenarioSpec,
         StateView,
+        WindowControl,
+        WindowResult,
     )
 
 
@@ -121,10 +124,14 @@ class Session:
     def advance(self, until_time: float | None = None) -> AdvanceResult:
         return self._rpc("advance", until_time)
 
+    def advance_window(self, until_s: float, control: WindowControl) -> WindowResult:
+        """Advance one control window, without per-event round trips."""
+        return self._rpc("advance_window", (until_s, control))
+
     def apply(self, decision_id: str, commands: tuple[DecisionCommand, ...]) -> None:
         self._rpc("apply", (decision_id, tuple(commands)))
 
-    def inspect(self, selection: tuple[str, ...] | None = None) -> StateView:
+    def inspect(self, selection: tuple[str, ...] | None = None) -> StateView | ContentView:
         return self._rpc("inspect", None if selection is None else tuple(selection))
 
     def result(self) -> RunResult:

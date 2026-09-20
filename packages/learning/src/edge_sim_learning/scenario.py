@@ -1,0 +1,195 @@
+"""Versioned synthetic workloads; policy-independent random streams."""
+
+import numpy as np
+from edge_sim_models import (
+    ArtifactSpec,
+    CacheNodeSpec,
+    ContentRequest,
+    ContentServiceSpec,
+    LinkSpec,
+    NodeSpec,
+    RouteSpec,
+    RunSpec,
+    ScenarioSpec,
+    SchedulerSpec,
+    TransferPoolSpec,
+)
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ScenarioConfig(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+    clusters: int = Field(default=3, ge=2)
+    caches: int = Field(default=10, ge=2)
+    request_rate: float = Field(default=300, gt=0)
+    catalog_size: int = Field(default=1000, ge=1)
+    zipf_alpha: float = Field(default=1, gt=0)
+    min_size: int = Field(default=500_000, ge=1)
+    max_size: int = Field(default=7_500_000, ge=1)
+    deadline_s: float = Field(default=1, gt=0)
+    period_s: float = Field(default=0.1, gt=0)
+    cycles: int = Field(default=128, ge=1)
+    bandwidth_bytes_s: float = Field(default=125_000_000, gt=0)
+    backhaul_bandwidth_bytes_s: float | None = Field(default=None, gt=0)
+    delivery_bandwidth_bytes_s: float | None = Field(default=None, gt=0)
+    backhaul_concurrency: int | None = Field(default=None, ge=1)
+    delivery_concurrency: int | None = Field(default=None, ge=1)
+    backhaul_waiting: int | None = Field(default=None, ge=0)
+    delivery_waiting: int | None = Field(default=None, ge=0)
+    cache_bytes: int = Field(default=100_000_000, ge=1)
+    backhaul_latency_s: float = Field(default=0.02, ge=0)
+    delivery_latency_s: float = Field(default=0.005, ge=0)
+    queue_capacity: int = Field(default=50, ge=0)
+    transfer_concurrency: int = Field(default=8, ge=1)
+    scheduler_capacity: int = Field(default=100, ge=0)
+    scheduler_service_s: float = Field(default=0.001, gt=0)
+
+    @classmethod
+    def profile(cls, name):
+        if name == "smoke":
+            return cls(
+                clusters=2,
+                caches=2,
+                catalog_size=16,
+                request_rate=30,
+                min_size=50_000,
+                max_size=500_000,
+                cycles=8,
+            )
+        dimensions = {"small": (3, 10, 300), "medium": (5, 20, 1000), "large": (7, 30, 2000)}
+        clusters, caches, rate = dimensions[name]
+        return cls(clusters=clusters, caches=caches, request_rate=rate)
+
+    @property
+    def horizon_s(self):
+        return self.cycles * self.period_s
+
+
+def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
+    if config.caches < config.clusters or config.max_size < config.min_size:
+        raise ValueError("each cluster needs a cache and size bounds must be ordered")
+    topology_seed, catalog_seed, arrivals_seed = np.random.SeedSequence(seed).spawn(3)
+    topo, catalog, arrivals = (
+        np.random.default_rng(s) for s in (topology_seed, catalog_seed, arrivals_seed)
+    )
+    sizes = catalog.integers(config.min_size, config.max_size + 1, config.catalog_size)
+    artifacts = tuple(
+        ArtifactSpec(id=f"object-{i}", size_bytes=int(size), locations=("origin",))
+        for i, size in enumerate(sizes)
+    )
+    nodes = [
+        NodeSpec(
+            id="origin",
+            role="cloud",
+            speed_flops=1e12,
+            memory_bytes=0,
+            storage_bytes=int(sizes.sum()),
+        )
+    ]
+    schedulers = tuple(
+        SchedulerSpec(
+            id=f"cluster-{i}",
+            max_waiting=config.scheduler_capacity,
+            service_s=config.scheduler_service_s,
+        )
+        for i in range(config.clusters)
+    )
+    for i in range(config.clusters):
+        nodes.append(
+            NodeSpec(id=f"users-{i}", role="client", speed_flops=1, memory_bytes=0, storage_bytes=0)
+        )
+    caches, links, routes = [], [], []
+    ownership = topo.permutation(config.caches) % config.clusters
+    pool = TransferPoolSpec(
+        max_active=config.transfer_concurrency, max_waiting=config.queue_capacity
+    )
+    for i in range(config.caches):
+        node, backhaul, delivery = f"cache-{i}", f"backhaul-{i}", f"delivery-{i}"
+        nodes.append(
+            NodeSpec(id=node, speed_flops=1e9, memory_bytes=0, storage_bytes=config.cache_bytes)
+        )
+        links.extend(
+            (
+                LinkSpec(
+                    id=backhaul,
+                    bandwidth_bytes_s=config.backhaul_bandwidth_bytes_s or config.bandwidth_bytes_s,
+                    latency_s=config.backhaul_latency_s,
+                ),
+                LinkSpec(
+                    id=delivery,
+                    bandwidth_bytes_s=config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s,
+                    latency_s=config.delivery_latency_s,
+                ),
+            )
+        )
+        routes.append(RouteSpec(src="origin", dst=node, links=(backhaul,)))
+        routes.extend(
+            RouteSpec(src=node, dst=f"users-{j}", links=(delivery,)) for j in range(config.clusters)
+        )
+        caches.append(
+            CacheNodeSpec(
+                node_id=node,
+                cluster_id=f"cluster-{ownership[i]}",
+                backhaul_link=backhaul,
+                delivery_link=delivery,
+                backhaul=TransferPoolSpec(
+                    max_active=config.backhaul_concurrency or pool.max_active,
+                    max_waiting=pool.max_waiting
+                    if config.backhaul_waiting is None
+                    else config.backhaul_waiting,
+                ),
+                delivery=TransferPoolSpec(
+                    max_active=config.delivery_concurrency or pool.max_active,
+                    max_waiting=pool.max_waiting
+                    if config.delivery_waiting is None
+                    else config.delivery_waiting,
+                ),
+            )
+        )
+    popularity = np.arange(1, config.catalog_size + 1, dtype=float) ** -config.zipf_alpha
+    popularity /= popularity.sum()
+    requests, now = [], 0.0
+    while True:
+        now += float(arrivals.exponential(1 / config.request_rate))
+        if now >= config.horizon_s:
+            break
+        cluster = int(arrivals.integers(config.clusters))
+        aid = int(arrivals.choice(config.catalog_size, p=popularity))
+        requests.append(
+            ContentRequest(
+                id=f"r-{len(requests)}",
+                artifact_id=f"object-{aid}",
+                cluster_id=f"cluster-{cluster}",
+                receiver=f"users-{cluster}",
+                arrival_s=now,
+                deadline_s=now + config.deadline_s,
+            )
+        )
+    run = RunSpec(
+        run_id=run_id,
+        seed=seed,
+        trace=trace,
+        control_mode="window",
+        scenario=ScenarioSpec(
+            nodes=tuple(nodes), links=tuple(links), routes=tuple(routes), artifacts=artifacts
+        ),
+        content=ContentServiceSpec(
+            origin="origin",
+            schedulers=schedulers,
+            caches=tuple(caches),
+            requests=tuple(requests),
+            size_scale_bytes=config.max_size,
+            deadline_scale_s=config.deadline_s,
+        ),
+    )
+    metadata = {
+        "expected_delivery_load": float(
+            config.request_rate
+            * (sizes * popularity).sum()
+            / (config.caches * (config.delivery_bandwidth_bytes_s or config.bandwidth_bytes_s))
+        ),
+        "request_count": len(requests),
+        "seed": seed,
+        "synthetic": True,
+    }
+    return run, metadata

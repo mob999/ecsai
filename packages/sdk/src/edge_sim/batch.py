@@ -12,7 +12,7 @@ from .session import SDKError, Session
 from .settings import Settings
 
 if TYPE_CHECKING:
-    from edge_sim_models import AdvanceResult, RunResult, RunSpec
+    from edge_sim_models import AdvanceResult, RunResult, RunSpec, WindowControl, WindowResult
 
 
 class BatchRunner:
@@ -47,7 +47,7 @@ class BatchRunner:
         self._requested: dict[str, float | None] = {}
         self._results: dict[str, RunResult] = {}
         self._errors: dict[str, SDKError] = {}
-        self._ready: dict[str, AdvanceResult | SDKError] = {}
+        self._ready: dict[str, AdvanceResult | WindowResult | SDKError] = {}
 
     def _check_open(self) -> None:
         if self._closed:
@@ -122,7 +122,18 @@ class BatchRunner:
                 return
         self._requested[run_id] = until_time
 
-    def recv_ready(self, timeout: float | None = None) -> dict[str, AdvanceResult | SDKError]:
+    def submit_window(self, run_id: str, until_s: float, control: WindowControl) -> None:
+        """Submit a window on an active session; collect with recv_ready()."""
+        self._check_open()
+        if run_id in self._requested or run_id in self._ready:
+            raise SDKError("busy", "Run has an outstanding or unread response")
+        session = self.session(run_id)
+        session._send("advance_window", (until_s, control))
+        self._requested[run_id] = until_s
+
+    def recv_ready(
+        self, timeout: float | None = None
+    ) -> dict[str, AdvanceResult | WindowResult | SDKError]:
         """Collect available replies, waiting at most timeout for pipe readiness.
 
         ``None`` waits until a reply or an RPC deadline; zero polls. Worker boot
@@ -150,7 +161,7 @@ class BatchRunner:
                     continue
                 try:
                     response = session._receive()
-                    if response.kind == "finished":
+                    if response.kind == "finished" and hasattr(response, "result"):
                         self._results[run_id] = response.result
                         self._ready[run_id] = response
                         self._requested.pop(run_id)
@@ -167,7 +178,9 @@ class BatchRunner:
         responses, self._ready = self._ready, {}
         return responses
 
-    def advance_all(self, until_time: float | None = None) -> dict[str, AdvanceResult | SDKError]:
+    def advance_all(
+        self, until_time: float | None = None
+    ) -> dict[str, AdvanceResult | WindowResult | SDKError]:
         """Barrier over the active snapshot, excluding runs queued for a worker slot.
 
         Existing asynchronous work must first be collected with recv_ready.
@@ -179,7 +192,7 @@ class BatchRunner:
         targets = self.active_ids
         for run_id in targets:
             self.submit_advance(run_id, until_time)
-        responses: dict[str, AdvanceResult | SDKError] = {}
+        responses: dict[str, AdvanceResult | WindowResult | SDKError] = {}
         while any(run_id not in responses for run_id in targets):
             responses.update(self.recv_ready())
         return responses
@@ -204,6 +217,20 @@ class BatchRunner:
         if run_id in self._queue:
             self._queue.remove(run_id)
         self._record_error(run_id, SDKError("cancelled", f"Run cancelled: {run_id}"))
+        self._fill()
+
+    def discard(self, run_id: str) -> None:
+        """Release a collected run and its metadata, for bounded episode recycling."""
+        self._check_open()
+        if run_id in self._requested:
+            raise SDKError("busy", "Collect the outstanding response before discarding")
+        session = self._active.pop(run_id, None)
+        if session is not None:
+            session.close()
+        if run_id in self._queue:
+            self._queue.remove(run_id)
+        for mapping in (self._runs, self._results, self._errors, self._ready):
+            mapping.pop(run_id, None)
         self._fill()
 
     def run(self) -> dict[str, RunResult]:
