@@ -63,8 +63,11 @@ def main():
         "version": 3,
     }
     manifest = root / "suite.json"
-    if manifest.exists() and json.loads(manifest.read_text()) != spec:
-        raise ValueError("Existing output has a different experiment specification")
+    if manifest.exists():
+        previous = json.loads(manifest.read_text())
+        previous["wandb_mode"] = spec["wandb_mode"]
+        if previous != spec:
+            raise ValueError("Existing output has a different experiment specification")
     manifest.write_text(json.dumps(spec, indent=2))
 
     def job(load, label, command, extra):
@@ -88,8 +91,11 @@ def main():
         ]
         signature = {"argv": argv, "scenario": cfg.model_dump()}
         record = folder / "job.json"
-        if record.exists() and json.loads(record.read_text()) != signature:
-            raise ValueError(f"Changed job: {folder}")
+        if record.exists():
+            previous = json.loads(record.read_text())
+            previous["argv"][previous["argv"].index("--wandb-mode") + 1] = args.wandb_mode
+            if previous != signature:
+                raise ValueError(f"Changed job: {folder}")
         record.write_text(json.dumps(signature, indent=2))
         expected = folder / (
             f"evaluation-stochastic-{steps}.json" if command == "train" else "evaluation.json"
