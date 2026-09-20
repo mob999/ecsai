@@ -1,9 +1,11 @@
-"""Bounded process scheduling using pipe readiness, without response-waiting threads."""
+"""Bounded process scheduling: parallel boot, pipe readiness for steady-state RPCs."""
 
 from __future__ import annotations
 
 import math
 from collections import deque
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.connection import wait
 from time import monotonic
 from typing import TYPE_CHECKING, Literal
@@ -70,6 +72,48 @@ class BatchRunner:
         self._queue.append(run_id)
         self._fill()
         return run_id
+
+    def submit_many(self, runs: Iterable[RunSpec]) -> tuple[str, ...]:
+        """Submit together, overlapping independent process boot handshakes.
+
+        Only Session construction runs in short-lived threads; all runner state
+        and subsequent RPC handling remain on the calling thread.
+        """
+        self._check_open()
+        runs = tuple(runs)
+        ids = tuple(run.run_id for run in runs)
+        if len(set(ids)) != len(ids) or any(rid in self._runs for rid in ids):
+            raise SDKError("duplicate_run_id", "Run IDs must be new and unique")
+        for run in runs:
+            self._runs[run.run_id] = run
+            self._queue.append(run.run_id)
+        count = min(len(self._queue), self.workers - len(self._active))
+        if count <= 1:
+            self._fill()
+            return ids
+        pending = [self._queue.popleft() for _ in range(count)]
+        futures = []
+        try:
+            with ThreadPoolExecutor(max_workers=count) as pool:
+                for rid in pending:
+                    futures.append(pool.submit(Session, self._runs[rid], self.timeout_s))
+                for rid, future in zip(pending, futures, strict=True):
+                    try:
+                        session = future.result()
+                        self._active[rid] = session
+                        if rid in self._requested:
+                            session._send("advance", self._requested[rid])
+                    except SDKError as error:
+                        self._record_error(rid, error)
+        except BaseException:
+            # Futures have joined; reclaim even successful boots not yet registered.
+            for future in futures:
+                if not future.cancelled() and future.exception() is None:
+                    future.result().close()
+            self.close()
+            raise
+        self._fill()
+        return ids
 
     def _record_error(self, run_id: str, error: SDKError) -> None:
         self._errors[run_id] = error

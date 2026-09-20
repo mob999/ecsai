@@ -454,3 +454,53 @@ def test_positive_reward_scaling_preserves_business_metrics():
             env.close()
     np.testing.assert_allclose(results[0][0] * 0.1, results[1][0])
     assert results[0][1] == results[1][1]
+
+
+@pytest.mark.parametrize("method", ["DEPPO-adapted", "DD-adapted"])
+def test_fast_batch_path_matches_pettingzoo_across_partial_reset(method):
+    from torchrl.envs import PettingZooWrapper
+
+    cfg = ScenarioConfig.profile("smoke").model_copy(update={"scheduler_release": "window"})
+    batch = ContentBatchEnv(cfg, 2, seed=42, method=method)
+    singles = [SchedulingEnv(cfg, seed=42, slot=i, method=method) for i in range(2)]
+    wrappers = [
+        PettingZooWrapper(e, group_map=batch.group_map, return_state=True, use_mask=False)
+        for e in singles
+    ]
+    for env in singles:
+        env.generation = 0
+    try:
+        td = batch.reset()
+        refs = [wrapper.reset() for wrapper in wrappers]
+        for step in range(6):
+            # Reset only slot zero mid-episode; slot one must keep its state.
+            if step == 3:
+                old_pid = batch.envs[1].session.pid
+                td["_reset"] = torch.tensor([[True], [False]])
+                td = batch.reset(td)
+                refs[0] = wrappers[0].reset()
+                assert batch.envs[1].session.pid == old_pid
+            actions = (
+                torch.stack(
+                    [
+                        torch.from_numpy(batch.envs[i].action_space("cluster-0").sample())
+                        for i in range(2)
+                    ]
+                )
+                .unsqueeze(1)
+                .expand(-1, 2, -1)
+                .clone()
+            )
+            td["agents", "action"] = actions
+            td = batch.step(td)["next"]
+            for i, wrapper in enumerate(wrappers):
+                refs[i]["agents", "action"] = actions[i]
+                refs[i] = wrapper.step(refs[i])["next"]
+                actual = td[i].exclude("metrics")
+                for key, value in refs[i].items(True, True):
+                    torch.testing.assert_close(actual[key], value, rtol=0, atol=0)
+                assert batch.envs[i].run == singles[i].run
+    finally:
+        batch.close()
+        for wrapper in wrappers:
+            wrapper.close()

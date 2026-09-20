@@ -300,3 +300,66 @@ def test_real_backend_sessions_are_repeatable_and_independent():
             assert first.result().state.requests[0].status == "SUCCEEDED"
             assert first.result().state == second.result().state
     assert "simgrid" not in sys.modules
+
+
+def test_submit_many_bounds_workers_and_preserves_error_isolation(protocol_backend):
+    with BatchRunner(workers=2, timeout_s=2) as runner:
+        assert runner.submit_many([_run("first"), _run("bad-boot"), _run("queued")]) == (
+            "first",
+            "bad-boot",
+            "queued",
+        )
+        assert set(runner.active_ids) == {"first", "queued"}
+        assert not runner.pending_ids
+        with pytest.raises(SDKError, match="startup_failed"):
+            runner.session("bad-boot")
+        errors = runner.recv_ready(0)
+        assert isinstance(errors["bad-boot"], SDKError)
+        for rid in runner.active_ids:
+            runner.submit_advance(rid)
+        results = {}
+        while len(results) < 2:
+            results.update(runner.recv_ready())
+        assert {rid: response.kind for rid, response in results.items()} == {
+            "first": "finished",
+            "queued": "finished",
+        }
+
+
+def test_submit_many_duplicates_are_rejected_atomically(protocol_backend):
+    with BatchRunner(workers=2) as runner:
+        with pytest.raises(SDKError, match="duplicate_run_id"):
+            runner.submit_many([_run("duplicate"), _run("duplicate")])
+        assert not runner.active_ids and not runner.pending_ids
+        runner.submit_many([_run("first"), _run("second"), _run("third")])
+        assert len(runner.active_ids) == 2
+        assert runner.pending_ids == ("third",)
+        with pytest.raises(SDKError, match="duplicate_run_id"):
+            runner.submit_many([_run("new"), _run("first")])
+        assert runner.pending_ids == ("third",)
+
+
+def test_submit_many_overlaps_boot_and_reclaims_partial_success(monkeypatch):
+    import threading
+
+    import edge_sim.batch as batch_module
+
+    barrier = threading.Barrier(2, timeout=5)
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, run, timeout):
+            barrier.wait()
+            if run.run_id == "broken":
+                raise RuntimeError("unexpected boot failure")
+            self.closed = False
+            sessions.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(batch_module, "Session", FakeSession)
+    with BatchRunner(workers=2) as runner:
+        with pytest.raises(RuntimeError, match="unexpected boot failure"):
+            runner.submit_many([_run("broken"), _run("healthy")])
+    assert len(sessions) == 1 and sessions[0].closed

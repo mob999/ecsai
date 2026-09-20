@@ -38,6 +38,7 @@ class SchedulingEnv(ParallelEnv):
         self.session = None
         self.run_id = None
         self.response = None
+        self._prepared_key = None
         self.state_space = Box(-np.inf, np.inf, (OBS * self.config.clusters,), np.float32)
         self.last_metrics = {}
         self._observation_space = Box(-np.inf, np.inf, (FEATURES,), np.float32)
@@ -60,14 +61,13 @@ class SchedulingEnv(ParallelEnv):
     def action_space(self, agent):
         return self._action_space
 
-    def reset(self, seed=None, options=None):
+    def prepare_reset(self, seed=None):
+        """Prepare a workload without booting; batch callers can start all together."""
         if seed is not None:
-            self.seed_value = seed
-            self.generation = 0
+            self.seed_value, self.generation = seed, 0
         episode_key = (self.seed_value, self.slot, self.generation)
-        # TorchRL probes the environment before the collector's initial reset.
-        # An untouched, identical cold episode can serve both; never reuse an
-        # advanced episode or a different seed/generation.
+        if self._prepared_key == episode_key:
+            return
         pristine = (
             self.session is not None
             and not self.session.closed
@@ -77,21 +77,22 @@ class SchedulingEnv(ParallelEnv):
         )
         if not pristine:
             self.close()
-        episode_seed = int(
-            np.random.SeedSequence([self.seed_value, self.slot, self.generation]).generate_state(1)[
-                0
-            ]
-        )
-        self.run_id = f"slot-{self.slot}-episode-{self.generation}"
-        self.generation += 1
-        if not pristine:
+            episode_seed = int(np.random.SeedSequence(episode_key).generate_state(1)[0])
+            self.run_id = f"slot-{self.slot}-episode-{self.generation}"
             self.run, self.workload = build_run(self.config, episode_seed, self.run_id)
+        self._prepared_key = episode_key
+
+    def reset(self, seed=None, options=None):
+        self.prepare_reset(seed)
+        if self.session is None:
             if self.runner is None:
                 self.session = start(self.run)
             else:
                 self.runner.submit(self.run)
                 self.session = self.runner.session(self.run_id)
-        self._episode_key = episode_key
+        self._episode_key = self._prepared_key
+        self._prepared_key = None
+        self.generation += 1
         self._pristine = True
         self.cache_clusters = {c.node_id: c.cluster_id for c in self.run.content.caches}
         self.link_ids = {

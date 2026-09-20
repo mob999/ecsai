@@ -2,6 +2,7 @@
 
 from time import perf_counter
 
+import numpy as np
 import torch
 from benchmarl.environments.common import TaskClass
 from edge_sim import BatchRunner, SDKError
@@ -23,6 +24,7 @@ class ContentBatchEnv(EnvBase):
         ]
         for env in self.envs:
             env.generation = episode_start
+        self._prepare_resets(self.envs)
         self.group_map = {"agents": self.envs[0].possible_agents}
         self.wrappers = [
             PettingZooWrapper(e, group_map=self.group_map, return_state=True, use_mask=False)
@@ -56,6 +58,46 @@ class ContentBatchEnv(EnvBase):
         self.previous = [None] * workers
         self.is_closed = False
 
+    def _prepare_resets(self, envs):
+        for env in envs:
+            env.prepare_reset()
+        pending = [env for env in envs if env.session is None]
+        self.runner.submit_many(env.run for env in pending)
+        for env in pending:
+            env.session = self.runner.session(env.run_id)
+
+    def _pack_step(self, env, observations, rewards, terminated, truncated):
+        # The fixed-agent contract has no dynamic masks or agent death. Keep the
+        # public PettingZoo wrapper for specs/checks, avoiding its per-agent
+        # conversions and copies on the vector collector's hot path.
+        agents = env.possible_agents
+        terminated = torch.tensor([terminated[a] for a in agents]).unsqueeze(-1)
+        truncated = torch.tensor([truncated[a] for a in agents]).unsqueeze(-1)
+        value = TensorDict(
+            {
+                "agents": TensorDict(
+                    {
+                        "observation": torch.from_numpy(
+                            np.stack([observations[a] for a in agents])
+                        ),
+                        "reward": torch.tensor(
+                            [rewards[a] for a in agents], dtype=torch.float32
+                        ).unsqueeze(-1),
+                        "terminated": terminated,
+                        "truncated": truncated,
+                        "done": terminated | truncated,
+                    },
+                    [len(agents)],
+                ),
+                "state": torch.from_numpy(env.state()),
+                "terminated": terminated.any(0),
+                "truncated": truncated.any(0),
+                "done": (terminated | truncated).any(0),
+            },
+            [],
+        )
+        return self._metrics(value, env)
+
     def _metrics(self, td, env):
         values = torch.tensor(
             [env.last_metrics.get(k, 0) for k in self.metric_keys], dtype=torch.float32
@@ -68,6 +110,13 @@ class ContentBatchEnv(EnvBase):
 
     def _reset(self, tensordict=None, **kwargs):
         mask = None if tensordict is None else tensordict.get("_reset", None)
+        self._prepare_resets(
+            [
+                env
+                for i, env in enumerate(self.envs)
+                if mask is None or mask[i].any() or self.previous[i] is None
+            ]
+        )
         values = []
         for i, (env, wrapper) in enumerate(zip(self.envs, self.wrappers, strict=True)):
             if mask is None or mask[i].any() or self.previous[i] is None:
@@ -80,8 +129,9 @@ class ContentBatchEnv(EnvBase):
 
     def _step(self, tensordict):
         targets = {}
+        batch_actions = tensordict["agents", "action"].detach().cpu().numpy()
         for i, env in enumerate(self.envs):
-            actions = tensordict["agents", "action"][i].detach().cpu().numpy()
+            actions = batch_actions[i]
             env.begin(dict(zip(env.possible_agents, actions, strict=True)))
             targets[env.run_id] = i
         pending = set(targets)
@@ -98,7 +148,8 @@ class ContentBatchEnv(EnvBase):
                 env.response_received = received
                 # Encode each ready worker while others are still simulating.
                 # Keep worker slots/time axes stable for on-policy PPO/GAE.
-                values[i] = self._metrics(self.wrappers[i].step(tensordict[i])["next"], env)
+                obs, rewards, terminated, truncated, _ = env.step(env.pending_actions)
+                values[i] = self._pack_step(env, obs, rewards, terminated, truncated)
                 pending.remove(run_id)
         self.previous = values
         return torch.stack(values)
