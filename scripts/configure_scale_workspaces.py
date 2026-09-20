@@ -24,7 +24,11 @@ METRICS = {
 
 
 def build_workspace(entity, project, scale, baseline_ids):
-    sizes = {"small": "3 clusters - 10 caches", "medium": "5 clusters - 20 caches", "large": "7 clusters - 30 caches"}
+    sizes = {
+        "small": "3 clusters - 10 caches",
+        "medium": "5 clusters - 20 caches",
+        "large": "7 clusters - 30 caches",
+    }
     panels = []
     for metric, title in METRICS.items():
         key = "eval_stochastic/" + metric
@@ -106,7 +110,10 @@ def main():
                 run.config.update(
                     {
                         "reference_only": True,
-                        "visualization_note": "Two endpoints of one fixed evaluation mean; not a training trajectory.",
+                        "visualization_note": (
+                            "Two endpoints of one fixed evaluation mean; "
+                            "not a training trajectory."
+                        ),
                     },
                     allow_val_change=True,
                 )
