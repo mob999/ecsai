@@ -41,6 +41,10 @@ def main():
         help="Also log sampled-policy validation; best checkpoint still uses deterministic scores",
     )
     p.add_argument("--resume", type=Path)
+    p.add_argument(
+        "--actor-init", type=Path, help="Initialize independent MAPPO actors from BC base"
+    )
+    p.add_argument("--head-only", action="store_true", help="Freeze pretrained actor backbone")
     p = sub.choices["evaluate"]
     p.add_argument(
         "--method", choices=["random", "local", "forward", "queue-adaptive"], default="local"
@@ -90,6 +94,8 @@ def main():
             initial_std=args.initial_std,
             eval_stochastic=args.eval_stochastic,
             eval_workers=args.eval_workers,
+            actor_init=args.actor_init,
+            head_only=args.head_only,
         )
     elif args.command == "evaluate":
         from .experiment import evaluate, save_report

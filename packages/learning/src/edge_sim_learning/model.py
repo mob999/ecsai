@@ -78,6 +78,8 @@ class ContextModel(Model):
         context_size=64,
         initial_std=None,
         input_dim=OBS,
+        actor_init=None,
+        head_only=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -96,6 +98,27 @@ class ContextModel(Model):
                 for _ in range(self.n_agents)
             ]
         ).to(self.device)
+        if actor_init is not None:
+            payload = torch.load(actor_init, map_location=self.device, weights_only=True)
+            config = payload["config"]
+            if (
+                config["format"] != "edge-bc-v1"
+                or config["hidden_size"] != hidden_size
+                or config["input_dim"] != input_dim
+                or config["action_dim"] * 2 != self.output_leaf_spec.shape[-1]
+                or use_context
+            ):
+                raise ValueError("base actor architecture mismatch")
+            for actor in self.actors:
+                actor.load_state_dict(payload["actor"], strict=True)
+        if head_only:
+            if use_context or input_dim != OBS:
+                raise ValueError("head-only adaptation requires a no-context actor")
+            for actor in self.actors:
+                for parameter in actor.parameters():
+                    parameter.requires_grad_(False)
+                for parameter in actor.mlp[-1].parameters():
+                    parameter.requires_grad_(True)
 
     def _forward(self, tensordict):
         x = tensordict[self.in_key]
@@ -112,6 +135,8 @@ class ContextConfig(ModelConfig):
     context_size: int = 64
     initial_std: float | None = None
     input_dim: int = OBS
+    actor_init: str | None = None
+    head_only: bool = False
 
     @staticmethod
     def associated_class():

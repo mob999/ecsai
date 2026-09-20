@@ -501,6 +501,8 @@ def train(
     initial_std=None,
     eval_stochastic=False,
     eval_workers=1,
+    actor_init=None,
+    head_only=False,
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -520,6 +522,12 @@ def train(
         raise ValueError("training counts must be positive")
     if method not in {"DEPPO-adapted", "MAPPO-no-context", "DD-adapted"}:
         raise ValueError("unknown learning method")
+    if actor_init is not None and resume is not None:
+        raise ValueError("choose base initialization or checkpoint resume, not both")
+    if (actor_init is not None or head_only) and method != "MAPPO-no-context":
+        raise ValueError("base adaptation currently supports MAPPO-no-context")
+    if head_only and actor_init is None and resume is None:
+        raise ValueError("head-only training requires a base actor or resumed checkpoint")
     if method == "DD-adapted":
         scenario = scenario.model_copy(update={"scheduler_release": "window"})
     action_dim = scenario.scheduler_capacity + 2 if method == "DD-adapted" else ACTION
@@ -573,6 +581,20 @@ def train(
         context_size=context_size,
         initial_std=initial_std,
     )
+    payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
+    if head_only and payload and not payload.get("training_options", {}).get("head_only", False):
+        raise ValueError("resume cannot change full training into head-only adaptation")
+    if actor_init is not None:
+        training_options.update(
+            actor_init_sha256=hashlib.sha256(Path(actor_init).read_bytes()).hexdigest(),
+            head_only=head_only,
+        )
+    elif payload and "actor_init_sha256" in payload.get("training_options", {}):
+        training_options.update(
+            actor_init_sha256=payload["training_options"]["actor_init_sha256"],
+            head_only=payload["training_options"]["head_only"],
+        )
+        head_only = training_options["head_only"]
     callback.training_options = training_options
     config = metadata(scenario, seed, method) | {
         "training_options": training_options,
@@ -587,7 +609,6 @@ def train(
         "wandb_mode": mode,
     }
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str))
-    payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
     if payload:
         legacy = dict(normalize_advantage=False, hidden_size=128, context_size=64, initial_std=None)
         if payload.get("training_options", legacy) != training_options:
@@ -619,6 +640,8 @@ def train(
             hidden_size=hidden_size,
             context_size=context_size,
             initial_std=initial_std,
+            actor_init=str(Path(actor_init).resolve()) if actor_init is not None else None,
+            head_only=head_only,
         ),
         critic_model_config=critic,
         seed=seed,
