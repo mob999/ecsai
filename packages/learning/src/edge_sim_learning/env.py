@@ -42,10 +42,22 @@ class SchedulingEnv(ParallelEnv):
         return self._action_space
 
     def reset(self, seed=None, options=None):
-        self.close()
         if seed is not None:
             self.seed_value = seed
             self.generation = 0
+        episode_key = (self.seed_value, self.slot, self.generation)
+        # TorchRL probes the environment before the collector's initial reset.
+        # An untouched, identical cold episode can serve both; never reuse an
+        # advanced episode or a different seed/generation.
+        pristine = (
+            self.session is not None
+            and not self.session.closed
+            and self._pristine
+            and self.response is None
+            and self._episode_key == episode_key
+        )
+        if not pristine:
+            self.close()
         episode_seed = int(
             np.random.SeedSequence([self.seed_value, self.slot, self.generation]).generate_state(1)[
                 0
@@ -53,12 +65,20 @@ class SchedulingEnv(ParallelEnv):
         )
         self.run_id = f"slot-{self.slot}-episode-{self.generation}"
         self.generation += 1
-        self.run, self.workload = build_run(self.config, episode_seed, self.run_id)
-        if self.runner is None:
-            self.session = start(self.run)
-        else:
-            self.runner.submit(self.run)
-            self.session = self.runner.session(self.run_id)
+        if not pristine:
+            self.run, self.workload = build_run(self.config, episode_seed, self.run_id)
+            if self.runner is None:
+                self.session = start(self.run)
+            else:
+                self.runner.submit(self.run)
+                self.session = self.runner.session(self.run_id)
+        self._episode_key = episode_key
+        self._pristine = True
+        self.cache_clusters = {c.node_id: c.cluster_id for c in self.run.content.caches}
+        self.link_ids = {
+            kind: {getattr(c, kind + "_link") for c in self.run.content.caches}
+            for kind in ("backhaul", "delivery")
+        }
         self.agents = self.possible_agents.copy()
         self.cycle = 0
         self.elapsed = 0
@@ -68,6 +88,7 @@ class SchedulingEnv(ParallelEnv):
         self.latencies = []
         self.episode_return = 0
         self.response = None
+        self.response_received = None
         self.last_metrics = self.metrics()
         return self._observations(), {a: {} for a in self.agents}
 
@@ -77,29 +98,36 @@ class SchedulingEnv(ParallelEnv):
     def _observations(self):
         result = {}
         for a in self.possible_agents:
-            history = np.zeros((HISTORY, OBS + ACTION), np.float32)
-            if self.history[a]:
-                history[: len(self.history[a])] = np.stack(self.history[a])
-            result[a] = np.concatenate(
-                (self.current[a], history.ravel(), [len(self.history[a])])
-            ).astype(np.float32)
+            value = np.zeros(FEATURES, np.float32)
+            value[:OBS] = self.current[a]
+            history = value[OBS:-1].reshape(HISTORY, OBS + ACTION)
+            for i, pair in enumerate(self.history[a]):
+                history[i] = pair
+            value[-1] = len(self.history[a])
+            result[a] = value
         return result
 
     def _encode(self, view):
         requests = {r.request_id: r for r in view.requests}
-        cache_clusters = {c.node_id: c.cluster_id for c in self.run.content.caches}
+        clustered_pools = {a: [] for a in self.possible_agents}
+        for pool in view.pools:
+            clustered_pools[self.cache_clusters[pool.node_id]].append(pool)
         for scheduler in view.schedulers:
-            pools = [p for p in view.pools if cache_clusters[p.node_id] == scheduler.cluster_id]
+            pools = clustered_pools[scheduler.cluster_id]
             loads = {}
             for kind in ("backhaul", "delivery"):
-                loads[kind] = np.mean(
-                    [
-                        (p.active + p.waiting) / max(1, (p.max_active or 1) + (p.max_waiting or 0))
-                        for p in pools
-                        if p.kind == kind
-                    ]
-                )
+                values = [
+                    (p.active + p.waiting) / max(1, (p.max_active or 1) + (p.max_waiting or 0))
+                    for p in pools
+                    if p.kind == kind
+                ]
+                loads[kind] = sum(values) / len(values)
             waiting = [requests[r] for r in scheduler.waiting]
+            if not waiting:
+                value = np.zeros(OBS, np.float32)
+                value[1:3] = loads["backhaul"], loads["delivery"]
+                self.current[scheduler.cluster_id] = value
+                continue
             size_bins = np.histogram(
                 [min(1, r.size_bytes / self.config.max_size) for r in waiting], bins=5, range=(0, 1)
             )[0]
@@ -139,15 +167,22 @@ class SchedulingEnv(ParallelEnv):
 
     def begin(self, actions, policy="threshold"):
         self.pending_control = self.control(actions, policy)
+        self._pristine = False
         self.pending_actions = {
             a: np.asarray(v, dtype=np.float32).copy() for a, v in actions.items()
         }
         self.step_started = perf_counter()
+        self.response_received = None
         boundary = (self.cycle + 1) * self.config.period_s
         if self.runner is not None:
-            self.runner.submit_window(self.run_id, boundary, self.pending_control)
+            self.runner.submit_window(
+                self.run_id, boundary, self.pending_control, scope="scheduling"
+            )
         else:
-            self.response = self.session.advance_window(boundary, self.pending_control)
+            self.response = self.session.advance_window(
+                boundary, self.pending_control, scope="scheduling"
+            )
+            self.response_received = perf_counter()
 
     def step(self, actions):
         if not self.agents:
@@ -157,7 +192,8 @@ class SchedulingEnv(ParallelEnv):
         if self.runner is not None and self.response is None:
             raise RuntimeError("batched environment must collect submitted responses")
         response, self.response = self.response, None
-        wall = perf_counter() - self.step_started
+        encoding_started = perf_counter()
+        wall = (self.response_received or encoding_started) - self.step_started
         for a in self.agents:
             self.history[a].append(np.concatenate((self.current[a], self.pending_actions[a])))
         self.cycle += 1
@@ -179,11 +215,13 @@ class SchedulingEnv(ParallelEnv):
             "episode_return": self.episode_return,
             "simulation_wall_s": response.simulation_wall_s,
             "ipc_wall_s": max(0, wall - response.simulation_wall_s),
+            "rpc_overhead_wall_s": max(0, wall - response.simulation_wall_s),
             "window_wall_s": wall,
             "window_completed": response.completed,
             "window_resolved": resolved,
         }
         observations = self._observations()
+        self.last_metrics["encoding_wall_s"] = perf_counter() - encoding_started
         rewards = dict.fromkeys(self.agents, reward)
         terminated = dict.fromkeys(self.agents, False)
         truncated = dict.fromkeys(self.agents, done)
@@ -197,7 +235,9 @@ class SchedulingEnv(ParallelEnv):
         limit = self.config.horizon_s + self.config.deadline_s
         while self.elapsed < limit:
             response = self.session.advance_window(
-                min(limit, self.elapsed + self.config.period_s), self.pending_control
+                min(limit, self.elapsed + self.config.period_s),
+                self.pending_control,
+                scope="scheduling",
             )
             self.last_view = response.view
             self.elapsed = response.view.now_s
@@ -225,12 +265,11 @@ class SchedulingEnv(ParallelEnv):
             "mean_latency_s": float(np.mean(self.latencies)) if self.latencies else 0,
             "simulated_time_s": v.now_s,
         }
-        for quantile in (50, 95, 99):
-            metrics[f"latency_p{quantile}_s"] = (
-                float(np.percentile(self.latencies, quantile)) if self.latencies else 0
-            )
+        percentiles = np.percentile(self.latencies, [50, 95, 99]) if self.latencies else (0, 0, 0)
+        for quantile, value in zip((50, 95, 99), percentiles, strict=True):
+            metrics[f"latency_p{quantile}_s"] = float(value)
         for kind in ("backhaul", "delivery"):
-            ids = {getattr(c, kind + "_link") for c in self.run.content.caches}
+            ids = self.link_ids[kind]
             counters = [link for link in v.links if link.link_id in ids]
             total = sum(link.bytes_sent for link in counters)
             capacity = sum(link.capacity_byte_seconds for link in counters)

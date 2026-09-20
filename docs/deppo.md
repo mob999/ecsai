@@ -2,7 +2,7 @@
 
 实现分三层：`edge-sim-models` 定义领域 DTO，`edge-sim-simgrid` 在独立进程中运行物理仿真，`edge-sim-learning` 负责观测、历史、奖励、采样和 BenchMARL MAPPO。SDK 不导入 NumPy、Torch、PettingZoo 或 BenchMARL；只安装 SDK 不会安装学习栈。
 
-验收测试、三种子小预算对照和 1/2/4 worker 数据见 [本机验收记录](deppo-validation.md)。完整 JSON 场景示例位于 `configs/learning/`。后续租用机器的 CUDA 检查和训练结果见 [Linux / 4090 验证记录](linux-validation.md)。
+验收测试、三种子小预算对照和 1/2/4 worker 数据见 [本机验收记录](deppo-validation.md)。完整 JSON 场景示例位于 `configs/learning/`。后续租用机器的 CUDA 检查和训练结果见 [Linux / 4090 验证记录](linux-validation.md)。最新本地优化、正确性对照和吞吐数据见 [采样性能验证](sampling-performance.md)。
 
 ## 安装与入口
 

@@ -59,6 +59,8 @@ class Transfer:
     dst: str
     waiters: set = field(default_factory=set)
     activity: object = None
+    accounted_remaining: float = 0.0
+    order: int = 0
 
 
 class ContentRuntime:
@@ -74,6 +76,11 @@ class ContentRuntime:
         self.queues = {s.id: deque() for s in self.spec.schedulers}
         self.busy = {}
         self.caches = {c.node_id: c for c in self.spec.caches}
+        self.cluster_load_caches = {
+            s: tuple(c for c, cfg in self.caches.items() if cfg.cluster_id == s)
+            for s in self.schedulers
+        }
+        self.cluster_caches = {s: tuple(sorted(c)) for s, c in self.cluster_load_caches.items()}
         self.nodes = {n.id: n for n in run.scenario.nodes}
         controlled_links = {
             link
@@ -83,12 +90,25 @@ class ContentRuntime:
         self.links = {link.id: link for link in run.scenario.links if link.id in controlled_links}
         self.routes = {(r.src, r.dst): r.links for r in run.scenario.routes}
         self.artifacts = {a.id: a for a in run.scenario.artifacts}
+        self.hosts = {n: sg.Host.by_name(n) for n in self.nodes}
+        self.delivery_weights = {
+            c: self.links[cfg.delivery_link].bandwidth_bytes_s for c, cfg in self.caches.items()
+        }
+        self.cluster_weights = {
+            s: sum(self.delivery_weights[c] for c in caches)
+            for s, caches in self.cluster_caches.items()
+        }
         self.replicas = {c: OrderedDict() for c in self.caches}
         self.reserved = {c: {} for c in self.caches}
         self.active = {(c, k): {} for c in self.caches for k in ("backhaul", "delivery")}
         self.waiting = {key: deque() for key in self.active}
         self.fetches = {}
         self.transfers = {}
+        self.activities = {}
+        self.pending = sg.ActivitySet([])
+        self.completed_ids = set()
+        self.request_transfer = {}
+        self.pins = Counter()
         self.link_bytes = Counter()
         self.counts = Counter()
         self.latencies = []
@@ -131,8 +151,7 @@ class ContentRuntime:
     def _cluster_load(self, cluster):
         values = [
             (self._load(c, "backhaul") + self._load(c, "delivery")) / 2
-            for c, cfg in self.caches.items()
-            if cfg.cluster_id == cluster
+            for c in self.cluster_load_caches[cluster]
         ]
         return sum(values) / len(values)
 
@@ -155,7 +174,7 @@ class ContentRuntime:
     def _schedule(self, rid):
         request = self.requests[rid]
         cluster = request.cluster
-        w = next(s.weights for s in self.control.schedulers if s.cluster_id == cluster)
+        w = self.control_weights[cluster]
         size = self.artifacts[request.spec.artifact_id].size_bytes
         x = (
             self._cluster_load(cluster),
@@ -168,28 +187,23 @@ class ContentRuntime:
             forward = {"local": False, "forward": True, "random": self.rng.random() < 0.5}[
                 self.control.policy
             ]
-        others = sorted(s for s in self.schedulers if s != cluster)
-        if forward and not request.forwarded and others:
-            target = min(others, key=lambda s: (self.broadcast[s], s))
+        target = self.forward_targets[cluster]
+        if forward and not request.forwarded and target is not None:
             request.forwarded = True
             self.counts["forwarded"] += 1
             self.emit("request_forwarded", rid, src=cluster, dst=target)
             self._enqueue(rid, target)
             return
-        caches = sorted(c for c, cfg in self.caches.items() if cfg.cluster_id == cluster)
+        caches = self.cluster_caches[cluster]
         # Smooth weighted round robin, weights use configured delivery capacities.
-        weights = {c: self.links[self.caches[c].delivery_link].bandwidth_bytes_s for c in caches}
         for c in caches:
-            self.rr[c] += weights[c]
+            self.rr[c] += self.delivery_weights[c]
         target = min(caches, key=lambda c: (-self.rr[c], c))
-        self.rr[target] -= sum(weights.values())
+        self.rr[target] -= self.cluster_weights[cluster]
         self.serve(Serve(request_id=rid, cache_node=target))
 
     def _pinned(self, cache, aid):
-        return any(
-            t.cache == cache and t.artifact == aid and t.kind == "delivery"
-            for t in self.transfers.values()
-        )
+        return self.pins[cache, aid] > 0
 
     def _reserve(self, cache, aid):
         size = self.artifacts[aid].size_bytes
@@ -220,6 +234,7 @@ class ContentRuntime:
         elif (cache, aid) in self.fetches:
             transfer = self.fetches[cache, aid]
             transfer.waiters.add(rid)
+            self.request_transfer[rid] = transfer
             request.status = "WAITING_DATA"
         else:
             if not self._reserve(cache, aid):
@@ -233,7 +248,12 @@ class ContentRuntime:
     def _new_transfer(self, aid, cache, kind, src, dst, waiters):
         self.transfer_sequence += 1
         t = Transfer(f"transfer-{self.transfer_sequence}", aid, cache, kind, src, dst, waiters)
+        t.order = self.transfer_sequence
         self.transfers[t.id] = t
+        for rid in waiters:
+            self.request_transfer[rid] = t
+        if kind == "delivery":
+            self.pins[cache, aid] += 1
         return t
 
     def _delivery(self, rid):
@@ -269,11 +289,14 @@ class ContentRuntime:
 
     def _start(self, t):
         t.activity = sg.Comm.sendto_async(
-            sg.Host.by_name(t.src),
-            sg.Host.by_name(t.dst),
+            self.hosts[t.src],
+            self.hosts[t.dst],
             self.artifacts[t.artifact].size_bytes,
         )
         self.active[t.cache, t.kind][t.id] = t
+        t.accounted_remaining = float(self.artifacts[t.artifact].size_bytes)
+        self.activities[t.activity] = t
+        self.pending.push(t.activity)
         self.emit(
             "transfer_started",
             t.id,
@@ -285,10 +308,22 @@ class ContentRuntime:
 
     def _remove_transfer(self, t, cancelled=False):
         key = t.cache, t.kind
+        self._account_bytes(t)
         self.active[key].pop(t.id, None)
-        if t in self.waiting[key]:
+        if t.activity is None and t in self.waiting[key]:
             self.waiting[key].remove(t)
         self.transfers.pop(t.id, None)
+        if t.activity is not None:
+            if t.id not in self.completed_ids:
+                self.pending.erase(t.activity)
+            self.completed_ids.discard(t.id)
+            self.activities.pop(t.activity)
+        for rid in t.waiters:
+            self.request_transfer.pop(rid, None)
+        if t.kind == "delivery":
+            self.pins[t.cache, t.artifact] -= 1
+            if not self.pins[t.cache, t.artifact]:
+                del self.pins[t.cache, t.artifact]
         if t.kind == "backhaul":
             self.fetches.pop((t.cache, t.artifact), None)
             self.reserved[t.cache].pop(t.artifact, None)
@@ -313,25 +348,44 @@ class ContentRuntime:
             self.emit("queue_overflow", rid, reason=reason)
         if status == "SUCCEEDED":
             self.latencies.append(self.now - r.spec.arrival_s)
-        for queue in self.queues.values():
-            if rid in queue:
-                queue.remove(rid)
-        for cluster, (active, _) in list(self.busy.items()):
-            if active == rid:
-                del self.busy[cluster]
-        for t in list(self.transfers.values()):
-            if rid in t.waiters:
-                t.waiters.remove(rid)
-                if not t.waiters:
-                    self._remove_transfer(t, cancelled=True)
+        queue = self.queues[r.cluster]
+        if rid in queue:
+            queue.remove(rid)
+        if r.cluster in self.busy and self.busy[r.cluster][0] == rid:
+            del self.busy[r.cluster]
+        t = self.request_transfer.pop(rid, None)
+        if t is not None:
+            t.waiters.remove(rid)
+            if not t.waiters:
+                self._remove_transfer(t, cancelled=True)
         self.emit("request_finished", rid, status=status, reason=reason)
+
+    def _account_bytes(self, t):
+        # Progress remains entirely native. Sampling at a boundary or just before
+        # removal accounts partial/cancelled transfers exactly without polling
+        # every unrelated event. No guessed rates or separate network solver.
+        if t.activity is None:
+            return
+        remaining = max(0.0, t.activity.remaining)
+        served = max(0.0, t.accounted_remaining - remaining)
+        for link in self.routes[t.src, t.dst]:
+            self.link_bytes[link] += served
+        t.accounted_remaining = remaining
+
+    def _collect_completed(self):
+        # Native test_any removes the returned activity. Preserve transfer creation
+        # order, not native completion notification order, for simultaneous events.
+        while self.pending.size:
+            activity = self.pending.test_any()
+            if activity is None:
+                break
+            self.completed_ids.add(self.activities[activity].id)
+        return sorted((self.transfers[tid] for tid in self.completed_ids), key=lambda t: t.order)
 
     def _settle(self, arrivals=True):
         # Completed delivery wins an exact deadline tie. Start newly available
         # work after expiration, so dead requests never consume a service slot.
-        completed = [
-            t for t in self.transfers.values() if t.activity is not None and t.activity.test()
-        ]
+        completed = self._collect_completed()
         # Release all simultaneous completions before admitting anything new.
         for t in completed:
             self._remove_transfer(t)
@@ -383,22 +437,19 @@ class ContentRuntime:
                 self._start(queue.popleft())
 
     def _wait(self, date):
-        active = [t for t in self.transfers.values() if t.activity is not None]
-        remaining = {t.id: t.activity.remaining for t in active}
-        if active:
+        if self.activities:
             try:
-                sg.ActivitySet([t.activity for t in active]).wait_any_for(max(0, date - self.now))
+                activity = self.pending.wait_any_for(max(0, date - self.now))
+                self.completed_ids.add(self.activities[activity].id)
             except sg.TimeoutException:
                 pass
         else:
             sg.this_actor.sleep_for(max(0, date - self.now))
-        for t in active:
-            served = max(0, remaining[t.id] - t.activity.remaining)
-            for link in self.routes[t.src, t.dst]:
-                self.link_bytes[link] += served
 
-    def advance_window(self, until_s, control):
+    def advance_window(self, until_s, control, scope="full"):
         started = perf_counter()
+        if scope not in {"full", "scheduling"}:
+            raise CommandError("invalid_scope", "expected full or scheduling snapshot")
         if not math.isfinite(until_s) or until_s <= self.now:
             raise CommandError("invalid_time", "window boundary must be finite and in the future")
         try:
@@ -412,9 +463,18 @@ class ContentRuntime:
             if until_s <= self.now:
                 raise CommandError("finished", "run time limit reached")
         self.control = control
+        self.control_weights = {c.cluster_id: c.weights for c in control.schedulers}
         self.broadcast = {
             s: 0.5 * self._cluster_load(s)
             + 0.5 * len(self.queues[s]) / max(1, self.schedulers[s].max_waiting)
+            for s in self.schedulers
+        }
+        self.forward_targets = {
+            s: min(
+                (other for other in self.schedulers if other != s),
+                key=lambda other: (self.broadcast[other], other),
+                default=None,
+            )
             for s in self.schedulers
         }
         start, before, link_before = self.now, self.counts.copy(), self.link_bytes.copy()
@@ -436,7 +496,7 @@ class ContentRuntime:
         return WindowResult(
             kind="finished" if finished else "time",
             start_s=start,
-            view=self.inspect(),
+            view=self.inspect(scope=scope),
             completed=self.counts["completed"] - before["completed"],
             timed_out=self.counts["timed_out"] - before["timed_out"],
             rejected=self.counts["rejected"] - before["rejected"],
@@ -451,11 +511,16 @@ class ContentRuntime:
             simulation_wall_s=perf_counter() - started,
         )
 
-    def inspect(self, selection=None):
+    def inspect(self, selection=None, *, scope="full"):
+        for t in self.activities.values():
+            self._account_bytes(t)
         selected = self.live | self.changed if selection is None else set(selection)
+        if scope == "scheduling":
+            selected = {rid for queue in self.queues.values() for rid in queue}
         if selected - self.requests.keys():
             raise CommandError("unknown_request", "unknown content request")
         return ContentView(
+            scope=scope,
             now_s=self.now,
             schedulers=tuple(
                 SchedulerState(
@@ -511,6 +576,7 @@ class ContentRuntime:
                     else self.artifacts[t.artifact].size_bytes,
                 )
                 for t in self.transfers.values()
+                if scope == "full"
             ),
             links=tuple(
                 LinkCounter(

@@ -151,6 +151,9 @@ class LinkCounter(DTO):
 
 
 class ContentView(DTO):
+    # Scheduling snapshots retain all counters/pools but include only queued
+    # scheduler requests and omit transfer details. inspect() remains full.
+    scope: Literal["full", "scheduling"] = "full"
     now_s: Seconds
     schedulers: tuple[SchedulerState, ...] = ()
     pools: tuple[PoolState, ...] = ()

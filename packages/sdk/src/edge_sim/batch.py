@@ -6,7 +6,7 @@ import math
 from collections import deque
 from multiprocessing.connection import wait
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .session import SDKError, Session
 from .settings import Settings
@@ -122,13 +122,20 @@ class BatchRunner:
                 return
         self._requested[run_id] = until_time
 
-    def submit_window(self, run_id: str, until_s: float, control: WindowControl) -> None:
+    def submit_window(
+        self,
+        run_id: str,
+        until_s: float,
+        control: WindowControl,
+        *,
+        scope: Literal["full", "scheduling"] = "full",
+    ) -> None:
         """Submit a window on an active session; collect with recv_ready()."""
         self._check_open()
         if run_id in self._requested or run_id in self._ready:
             raise SDKError("busy", "Run has an outstanding or unread response")
         session = self.session(run_id)
-        session._send("advance_window", (until_s, control))
+        session._send("advance_window", (until_s, control, scope))
         self._requested[run_id] = until_s
 
     def recv_ready(

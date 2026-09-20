@@ -203,3 +203,58 @@ def test_backhaul_and_delivery_configured_independently():
         assert links[cache.delivery_link].bandwidth_bytes_s == 2000
         assert cache.backhaul.max_active == 2 and cache.backhaul.max_waiting == 0
         assert cache.delivery.max_active == 3 and cache.delivery.max_waiting == 7
+
+
+@pytest.mark.parametrize("episode_start", [0, 3])
+def test_spec_probe_reuses_only_identical_pristine_episode(episode_start):
+    env = ContentBatchEnv(ScenarioConfig.profile("smoke"), 1, seed=42, episode_start=episode_start)
+    try:
+        probe = env.envs[0]
+        pid = probe.session.pid
+        workload = probe.run
+        td = env.reset()
+        assert probe.session.pid == pid
+        assert probe.run == workload
+        assert probe.generation == episode_start + 1
+        env.step(env.rand_action(td))
+        env.set_seed(42)
+        env.reset()
+        assert probe.session.pid != pid  # used cache/history cannot be reused
+        if episode_start == 0:
+            assert probe.run == workload
+        else:
+            assert probe.run != workload
+        assert probe.generation == 1
+    finally:
+        env.close()
+
+
+def test_ready_batch_slots_match_independent_episodes():
+    config = ScenarioConfig.profile("smoke")
+    batch = ContentBatchEnv(config, 2, seed=13)
+    singles = [SchedulingEnv(config, seed=13, slot=i) for i in range(2)]
+    try:
+        td = batch.reset()
+        for env in singles:
+            env.reset()
+        for _ in range(config.cycles):
+            actions = torch.tensor([[[0, 0, 0, -5]] * 2, [[0, 0, 0, 5]] * 2], dtype=torch.float32)
+            td["agents", "action"] = actions
+            following = batch.step(td)["next"]
+            for i, env in enumerate(singles):
+                obs, rewards, _, truncated, _ = env.step(
+                    dict(zip(env.possible_agents, actions[i].numpy(), strict=True))
+                )
+                np.testing.assert_array_equal(
+                    following["agents", "observation"][i].numpy(), np.stack(list(obs.values()))
+                )
+                np.testing.assert_allclose(
+                    following["agents", "reward"][i].numpy().ravel(), list(rewards.values())
+                )
+                assert following["truncated"][i].item() == all(truncated.values())
+                assert batch.envs[i].last_metrics["arrived"] == env.last_metrics["arrived"]
+            td = following.exclude("reward", ("agents", "reward"))
+    finally:
+        batch.close()
+        for env in singles:
+            env.close()

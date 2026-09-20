@@ -1,5 +1,7 @@
 """Vector sampling over SDK workers; no second layer of process vectorization."""
 
+from time import perf_counter
+
 import torch
 from benchmarl.environments.common import TaskClass
 from edge_sim import BatchRunner, SDKError
@@ -18,6 +20,8 @@ class ContentBatchEnv(EnvBase):
         self.envs = [
             SchedulingEnv(config, seed=seed, runner=self.runner, slot=i) for i in range(workers)
         ]
+        for env in self.envs:
+            env.generation = episode_start
         self.group_map = {"agents": self.envs[0].possible_agents}
         self.wrappers = [
             PettingZooWrapper(e, group_map=self.group_map, return_state=True, use_mask=False)
@@ -33,6 +37,8 @@ class ContentBatchEnv(EnvBase):
                 "episode_return",
                 "simulation_wall_s",
                 "ipc_wall_s",
+                "rpc_overhead_wall_s",
+                "encoding_wall_s",
                 "window_wall_s",
                 "window_completed",
                 "window_resolved",
@@ -48,11 +54,11 @@ class ContentBatchEnv(EnvBase):
         self.is_closed = False
 
     def _metrics(self, td, env):
+        values = torch.tensor(
+            [env.last_metrics.get(k, 0) for k in self.metric_keys], dtype=torch.float32
+        ).split(1)
         td["metrics"] = TensorDict(
-            {
-                k: torch.tensor([env.last_metrics.get(k, 0)], dtype=torch.float32)
-                for k in self.metric_keys
-            },
+            dict(zip(self.metric_keys, values, strict=True)),
             [],
         )
         return td
@@ -74,18 +80,23 @@ class ContentBatchEnv(EnvBase):
         for i, env in enumerate(self.envs):
             actions = tensordict["agents", "action"][i].detach().cpu().numpy()
             env.begin(dict(zip(env.possible_agents, actions, strict=True)))
-            targets[env.run_id] = env
+            targets[env.run_id] = i
         pending = set(targets)
+        values = [None] * len(self.envs)
         while pending:
-            for run_id, response in self.runner.recv_ready().items():
+            responses = self.runner.recv_ready()
+            received = perf_counter()
+            for run_id, response in responses.items():
                 if isinstance(response, SDKError):
                     raise response
-                targets[run_id].response = response
+                i = targets[run_id]
+                env = self.envs[i]
+                env.response = response
+                env.response_received = received
+                # Encode each ready worker while others are still simulating.
+                # Keep worker slots/time axes stable for on-policy PPO/GAE.
+                values[i] = self._metrics(self.wrappers[i].step(tensordict[i])["next"], env)
                 pending.remove(run_id)
-        values = [
-            self._metrics(wrapper.step(tensordict[i])["next"], env)
-            for i, (env, wrapper) in enumerate(zip(self.envs, self.wrappers, strict=True))
-        ]
         self.previous = values
         return torch.stack(values)
 

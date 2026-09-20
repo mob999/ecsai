@@ -21,17 +21,22 @@ def benchmark(config, workers=(1, 2, 4), steps=128, seed=0):
             td = env.reset()
             setup = perf_counter() - started
             sampling = perf_counter()
-            native = ipc = processed = 0.0
-            for _ in range(steps):
+            native = ipc = processed = encoding = reset_wall = 0.0
+            resets = 0
+            for step in range(steps):
                 td = env.rand_action(td)
                 next_td = env.step(td)["next"]
                 metrics = next_td["metrics"]
                 native += metrics["simulation_wall_s"].sum().item()
                 ipc += metrics["ipc_wall_s"].sum().item()
+                encoding += metrics["encoding_wall_s"].sum().item()
                 processed += metrics["window_resolved"].sum().item()
-                if next_td["done"].any():
+                if next_td["done"].any() and step + 1 < steps:
                     next_td["_reset"] = next_td["done"]
+                    reset_started = perf_counter()
                     td = env.reset(next_td)
+                    reset_wall += perf_counter() - reset_started
+                    resets += 1
                 else:
                     td = next_td.exclude("reward", ("agents", "reward"))
             wall = perf_counter() - sampling
@@ -45,6 +50,11 @@ def benchmark(config, workers=(1, 2, 4), steps=128, seed=0):
                     "requests_s": processed / wall,
                     "simulation_worker_seconds": native,
                     "ipc_and_wait_worker_seconds": ipc,
+                    "rpc_overhead_worker_seconds": ipc,
+                    "encoding_worker_seconds": encoding,
+                    "reset_wall_s": reset_wall,
+                    "batch_resets": resets,
+                    "end_to_end_steps_s": steps * count / (setup + wall),
                 }
             )
         finally:

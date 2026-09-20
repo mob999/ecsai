@@ -223,3 +223,47 @@ def test_simultaneous_scheduler_completions_release_capacity_first():
         out = session.advance_window(5, control(run, 5))
         assert out.view.completed == 2
         assert out.view.overflows == 0
+
+
+def test_partial_bytes_at_boundaries_and_cancellation_are_not_double_counted():
+    run = scenario([("r0", "a", 0, 0, 0.5)])
+    with start(run) as session:
+        first = session.advance_window(0.25, control(run))
+        assert first.view.links[0].bytes_sent == pytest.approx(24.9)
+        assert session.inspect().links == first.view.links
+        second = session.advance_window(0.6, control(run))
+        assert second.view.timed_out == 1
+        assert second.view.links[0].bytes_sent == pytest.approx(49.9)
+        assert second.link_bytes[0].bytes_sent == pytest.approx(25)
+        third = session.advance_window(1, control(run))
+        assert sum(link.bytes_sent for link in third.link_bytes) == 0
+        assert third.view.links[0].bytes_sent == pytest.approx(49.9)
+
+
+def test_scheduling_snapshot_preserves_counters_and_full_inspection():
+    run = scenario([(f"r{i}", f"a{i % 2}", 0, i * 0.0001, 0.5 + i) for i in range(6)])
+    with start(run) as full, start(run) as compact:
+        for boundary in (0.0005, 0.25, 0.6, 1.5, 3, 8):
+            a = full.advance_window(boundary, control(run))
+            b = compact.advance_window(boundary, control(run), scope="scheduling")
+            assert b.view.scope == "scheduling" and not b.view.transfers
+            assert {r.request_id for r in b.view.requests} == {
+                rid for s in b.view.schedulers for rid in s.waiting
+            }
+            exclude = {"scope", "requests", "transfers"}
+            assert a.view.model_dump(exclude=exclude) == b.view.model_dump(exclude=exclude)
+            assert a.link_bytes == b.link_bytes
+            assert compact.inspect() == full.inspect()
+        assert compact.result().state == full.result().state
+        with pytest.raises(SDKError, match="invalid_scope"):
+            compact.advance_window(9, control(run), scope="invalid")
+        assert compact.advance_window(9, control(run)).view.scope == "full"
+
+
+def test_simultaneous_delivery_completions_win_exact_deadline():
+    run = scenario([("r0", "a", 0, 0, 2.001), ("r1", "a", 1, 0, 2.001)], caches=2)
+    with start(run) as session:
+        out = session.advance_window(2.001, control(run))
+        assert out.completed == 2 and out.timed_out == 0
+        assert not out.view.transfers
+        assert sum(link.bytes_sent for link in out.link_bytes) == pytest.approx(400)

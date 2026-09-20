@@ -6,7 +6,7 @@ import math
 import multiprocessing as mp
 from multiprocessing.connection import wait
 from time import monotonic
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .settings import Settings
 
@@ -124,9 +124,19 @@ class Session:
     def advance(self, until_time: float | None = None) -> AdvanceResult:
         return self._rpc("advance", until_time)
 
-    def advance_window(self, until_s: float, control: WindowControl) -> WindowResult:
-        """Advance one control window, without per-event round trips."""
-        return self._rpc("advance_window", (until_s, control))
+    def advance_window(
+        self,
+        until_s: float,
+        control: WindowControl,
+        *,
+        scope: Literal["full", "scheduling"] = "full",
+    ) -> WindowResult:
+        """Advance a window. Scheduling scope omits transfers and nonqueued requests.
+
+        Both scopes retain exact interval/cumulative counters and completion
+        latencies. Use inspect() to retrieve full live state on demand.
+        """
+        return self._rpc("advance_window", (until_s, control, scope))
 
     def apply(self, decision_id: str, commands: tuple[DecisionCommand, ...]) -> None:
         self._rpc("apply", (decision_id, tuple(commands)))
