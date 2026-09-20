@@ -1,5 +1,7 @@
 # Linux / RTX 4090 验证记录
 
+本文为优化前记录。最新同机对照和 CUDA 续训验收见 [Linux 采样优化验收](linux-sampling-validation.md)。
+
 2026-09-20 在租用机器上验证。服务器项目目录为 `/root/ecsai`；源码快照包含当时本地未提交修改，校验清单保存在服务器 `SOURCE_SNAPSHOT.json`。未启动完整 2048 episode 训练。
 
 ## 环境

@@ -61,4 +61,4 @@ macOS 26.5.1 / arm64，CPU，锁定依赖；small 配置、固定种子 0、每 
 
 对照旧版本时，将旧版本各 `packages/*/src` 目录放入 `PYTHONPATH`，运行相同的 `profile_sampling.py` 生成 `semantics.json`；新版本命令加 `--compare 旧结果/semantics.json` 会验证每个字段，失败以非零状态退出。开启 cProfile 的运行只用于归因，不混入性能中位数。
 
-服务器开机后先拉取提交，再重复 Linux 1/2/4 worker benchmark 与 CUDA smoke。macOS 本地结果不能直接代替租用 Linux 的加速倍数或 GPU 利用率测量。依赖锁文件没有因本次性能优化改变。
+服务器已拉取提交并完成 Linux 1/2/4 worker benchmark、CUDA 训练与续训，见 [Linux 采样优化验收](linux-sampling-validation.md)。macOS 本地结果不能直接代替租用 Linux 的加速倍数或 GPU 利用率测量。依赖锁文件没有因本次性能优化改变。
