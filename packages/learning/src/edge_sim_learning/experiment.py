@@ -5,11 +5,13 @@ import csv
 import hashlib
 import importlib.metadata
 import json
+import multiprocessing
 import os
 import platform
 import random
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
@@ -46,6 +48,51 @@ def restore_rng_states(payload):
 
 @torch.random.fork_rng(devices=[])
 def evaluate(
+    config,
+    method="local",
+    policy=None,
+    seeds=None,
+    fixed_ratio=None,
+    exploration="deterministic",
+    workers=1,
+):
+    """Run independent episodes in seed order, isolating each policy RNG in a process."""
+    if workers < 1:
+        raise ValueError("evaluation workers must be positive")
+    seeds = list(seeds if seeds is not None else range(1_000_000_000, 1_000_000_010))
+    if not seeds:
+        raise ValueError("at least one evaluation episode is required")
+    started = perf_counter()
+    worker_count = min(workers, len(seeds))
+    if worker_count == 1:
+        result = _evaluate_serial(config, method, policy, seeds, fixed_ratio, exploration)
+    else:
+        # Never fork a CUDA training process. Only a detached CPU policy enters workers.
+        cpu_policy = copy.deepcopy(policy).cpu().eval() if policy is not None else None
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_init_evaluation_worker,
+            initargs=(config, method, cpu_policy, fixed_ratio, exploration),
+        ) as pool:
+            episodes = list(pool.map(_evaluate_seed, seeds))
+        result = _evaluation_report(method, exploration, fixed_ratio, seeds, episodes)
+    return result | {"workers": worker_count, "evaluation_wall_s": perf_counter() - started}
+
+
+def _init_evaluation_worker(config, method, policy, fixed_ratio, exploration):
+    global _evaluation_inputs
+    torch.set_num_threads(1)
+    _evaluation_inputs = (config, method, policy, fixed_ratio, exploration)
+
+
+def _evaluate_seed(seed):
+    config, method, policy, fixed_ratio, exploration = _evaluation_inputs
+    return _evaluate_serial(config, method, policy, [seed], fixed_ratio, exploration)["episodes"][0]
+
+
+@torch.random.fork_rng(devices=[])
+def _evaluate_serial(
     config, method="local", policy=None, seeds=None, fixed_ratio=None, exploration="deterministic"
 ):
     if exploration not in {"deterministic", "stochastic"}:
@@ -136,6 +183,10 @@ def evaluate(
             )
         finally:
             env.close()
+    return _evaluation_report(method, exploration, fixed_ratio, seeds, episodes)
+
+
+def _evaluation_report(method, exploration, fixed_ratio, seeds, episodes):
     means = {
         key: float(np.mean([row[key] for row in episodes]))
         for key in episodes[0]
@@ -207,14 +258,23 @@ class InferenceTimer:
 
 class RunLog(Callback):
     def __init__(
-        self, output, scenario, method, seed, mode, eval_interval, eval_episodes,
+        self,
+        output,
+        scenario,
+        method,
+        seed,
+        mode,
+        eval_interval,
+        eval_episodes,
         eval_stochastic=False,
+        eval_workers=1,
     ):
         super().__init__()
         self.output = str(output)
         self.scenario, self.method, self.seed = scenario, method, seed
         self.mode, self.eval_interval, self.eval_episodes = mode, eval_interval, eval_episodes
         self.eval_stochastic = eval_stochastic
+        self.eval_workers = eval_workers
         self.best = (-1.0, float("-inf"))
         self.best_stochastic = (-1.0, float("-inf"))
 
@@ -353,8 +413,14 @@ class RunLog(Callback):
                 self.method,
                 exp.policy,
                 range(1_000_000_000, 1_000_000_000 + self.eval_episodes),
+                workers=self.eval_workers,
             )
-            self.emit({"eval/" + k: v for k, v in result["mean"].items()})
+            self.emit(
+                {"eval/" + k: v for k, v in result["mean"].items()}
+                | {
+                    "eval/evaluation_wall_s": result["evaluation_wall_s"],
+                }
+            )
             (Path(self.output) / f"evaluation-{exp.total_frames}.json").write_text(
                 json.dumps(result, indent=2)
             )
@@ -369,13 +435,20 @@ class RunLog(Callback):
                     exp.policy,
                     result["seeds"],
                     exploration="stochastic",
+                    workers=self.eval_workers,
                 )
-                self.emit({"eval_stochastic/" + k: v for k, v in sampled["mean"].items()})
+                self.emit(
+                    {"eval_stochastic/" + k: v for k, v in sampled["mean"].items()}
+                    | {
+                        "eval_stochastic/evaluation_wall_s": sampled["evaluation_wall_s"],
+                    }
+                )
                 (Path(self.output) / f"evaluation-stochastic-{exp.total_frames}.json").write_text(
                     json.dumps(sampled, indent=2)
                 )
                 sampled_score = (
-                    sampled["mean"]["success_rate"], -sampled["mean"]["mean_latency_s"]
+                    sampled["mean"]["success_rate"],
+                    -sampled["mean"]["mean_latency_s"],
                 )
                 if sampled_score > self.best_stochastic:
                     self.best_stochastic = sampled_score
@@ -405,11 +478,21 @@ def train(
     context_size=64,
     initial_std=None,
     eval_stochastic=False,
+    eval_workers=1,
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     if (
-        min(episodes, workers, frames_per_batch, epochs, minibatch, eval_interval, eval_episodes)
+        min(
+            episodes,
+            workers,
+            frames_per_batch,
+            epochs,
+            minibatch,
+            eval_interval,
+            eval_episodes,
+            eval_workers,
+        )
         < 1
     ):
         raise ValueError("training counts must be positive")
@@ -449,7 +532,15 @@ def train(
         activation_class=torch.nn.ReLU,
     )
     callback = RunLog(
-        output, scenario, method, seed, mode, eval_interval, eval_episodes, eval_stochastic
+        output,
+        scenario,
+        method,
+        seed,
+        mode,
+        eval_interval,
+        eval_episodes,
+        eval_stochastic,
+        eval_workers,
     )
     training_options = dict(
         normalize_advantage=normalize_advantage,
@@ -467,6 +558,7 @@ def train(
         "eval_interval": eval_interval,
         "eval_episodes": eval_episodes,
         "eval_stochastic": eval_stochastic,
+        "eval_workers": eval_workers,
         "wandb_mode": mode,
     }
     (output / "config.json").write_text(json.dumps(config, indent=2, default=str))

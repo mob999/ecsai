@@ -120,8 +120,9 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
         epochs=1,
         minibatch=8,
         eval_interval=16,
-        eval_episodes=1,
+        eval_episodes=2,
         eval_stochastic=True,
+        eval_workers=2,
     )
     train(output=tmp_path / "first", **common)
     payload = torch.load(tmp_path / "first" / "last.pt", weights_only=False)
@@ -141,6 +142,17 @@ def test_cpu_update_checkpoint_restore_and_offline_logs(tmp_path):
     assert torch.equal(torch.get_rng_state(), rng_before)
     assert repeated["mean"]["success_rate"] == sampled["mean"]["success_rate"]
     assert repeated["mean"]["episode_return"] == sampled["mean"]["episode_return"]
+    for mode, parallel in (("deterministic", deterministic), ("stochastic", sampled)):
+        serial = evaluate(
+            cfg, "DEPPO-adapted", payload["policy"], parallel["seeds"], exploration=mode, workers=1
+        )
+        assert parallel["workers"] == 2
+        assert parallel["evaluation_wall_s"] > 0
+        for a, b in zip(serial["episodes"], parallel["episodes"], strict=True):
+            assert {k: v for k, v in a.items() if not k.endswith("wall_s")} == {
+                k: v for k, v in b.items() if not k.endswith("wall_s")
+            }
+        assert torch.equal(torch.get_rng_state(), rng_before)
     best = torch.load(tmp_path / "first/best.pt", weights_only=False)
     assert best["best"][0] == deterministic["mean"]["success_rate"]
     sampled_best = torch.load(tmp_path / "first/best-stochastic.pt", weights_only=False)

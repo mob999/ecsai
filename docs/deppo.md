@@ -111,3 +111,14 @@ available selected checkpoints survive resume. Older checkpoints without a
 sampled best score remain loadable; sampled selection starts at the next
 validation, and cannot reconstruct models from earlier logged scores. Evaluate
 each checkpoint with its corresponding `--exploration` mode and report that mode.
+
+
+### 并行验证
+
+训练使用 `--eval-workers 2` 并行运行独立验证 episode；独立 evaluate 使用
+`--workers 2`。默认 1 保留串行行为。每个进程使用 CPU 策略与独立种子，
+按输入种子顺序汇总；验证数量、排空规则及 checkpoint 选择标准不变。
+并行度属于执行配置，可以在恢复 checkpoint 时修改。
+`eval/evaluation_wall_s` 与 `eval_stochastic/evaluation_wall_s` 记录包含
+进程启动及回收的整批实际耗时；原有 `wall_s` 是单 episode 耗时均值。
+多实验同时运行时应按总 CPU 数限制验证并行度。

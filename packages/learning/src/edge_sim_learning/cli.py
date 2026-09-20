@@ -32,8 +32,10 @@ def main():
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     p.add_argument("--eval-interval", type=int, default=8192)
     p.add_argument("--eval-episodes", type=int, default=10)
+    p.add_argument("--eval-workers", type=int, default=1)
     p.add_argument(
-        "--eval-stochastic", action="store_true",
+        "--eval-stochastic",
+        action="store_true",
         help="Also log sampled-policy validation; best checkpoint still uses deterministic scores",
     )
     p.add_argument("--resume", type=Path)
@@ -48,6 +50,7 @@ def main():
     p.add_argument("--split", choices=["validation", "test"], default="validation")
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--episodes", type=int, default=10)
+    p.add_argument("--workers", type=int, default=1, help="Parallel evaluation episodes")
     p = sub.choices["benchmark"]
     p.add_argument("--workers", type=int, nargs="+", default=[1, 2, 4])
     p.add_argument("--steps", type=int, default=128)
@@ -84,6 +87,7 @@ def main():
             context_size=args.context_size,
             initial_std=args.initial_std,
             eval_stochastic=args.eval_stochastic,
+            eval_workers=args.eval_workers,
         )
     elif args.command == "evaluate":
         from .experiment import evaluate, save_report
@@ -109,6 +113,7 @@ def main():
             range(base_seed + args.seed, base_seed + args.seed + args.episodes),
             fixed_ratio=args.fixed_ratio,
             exploration=args.exploration,
+            workers=args.workers,
         )
         (args.output / "evaluation.json").write_text(json.dumps(result, indent=2))
         save_report(args.output, config, args.seed, method, args.wandb_mode, [result["mean"]])
