@@ -307,7 +307,7 @@ class RunLog(Callback):
             entity=os.environ.get("WANDB_ENTITY"),
             mode=self.mode,
             dir=self.output,
-            name=f"{self.method}-seed{self.seed}",
+            name=os.environ.get("ECSAI_RUN_NAME", f"{self.method}-seed{self.seed}"),
             config=metadata(self.scenario, self.seed, self.method),
         )
         self.run.define_metric("env_steps")
@@ -670,7 +670,7 @@ def save_report(output, config, seed, method, mode, rows):
         entity=os.environ.get("WANDB_ENTITY"),
         mode=mode,
         dir=str(output),
-        name=method,
+        name=os.environ.get("ECSAI_RUN_NAME", method),
         config=meta,
     )
     try:
