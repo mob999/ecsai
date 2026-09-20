@@ -34,6 +34,15 @@ ADAPTATION = (
 )
 
 
+def restore_rng_states(payload):
+    """Checkpoint map_location may move generator states; restore from CPU bytes."""
+    torch.set_rng_state(payload["torch_rng"].cpu())
+    if payload.get("cuda_rng") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([state.cpu() for state in payload["cuda_rng"]])
+    np.random.set_state(payload["numpy_rng"])
+    random.setstate(payload["python_rng"])
+
+
 def evaluate(config, method="local", policy=None, seeds=None):
     torch.set_num_threads(1)
     seeds = list(seeds if seeds is not None else range(1_000_000_000, 1_000_000_010))
@@ -391,11 +400,7 @@ def train(
                     callback.best = payload["best"]
                     if previous_best != output / "best.pt":
                         shutil.copy2(previous_best, output / "best.pt")
-            torch.set_rng_state(payload["torch_rng"].cpu())
-            if payload.get("cuda_rng") is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(payload["cuda_rng"])
-            np.random.set_state(payload["numpy_rng"])
-            random.setstate(payload["python_rng"])
+            restore_rng_states(payload)
             experiment.collector.update_policy_weights_()
         experiment.run()
     finally:

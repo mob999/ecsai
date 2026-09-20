@@ -258,3 +258,50 @@ def test_ready_batch_slots_match_independent_episodes():
         batch.close()
         for env in singles:
             env.close()
+
+
+def test_restore_cuda_rng_normalizes_checkpoint_states_to_cpu(monkeypatch):
+    import random
+    from types import SimpleNamespace
+
+    from edge_sim_learning.experiment import restore_rng_states
+
+    state = torch.tensor([1, 2, 3], dtype=torch.uint8)
+    received = []
+    payload = {
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng": [SimpleNamespace(cpu=lambda: state)],
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }
+    expected = torch.rand(3), np.random.random(3), random.random()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", received.extend)
+    restore_rng_states(payload)
+    assert len(received) == 1 and received[0] is state
+    assert torch.equal(torch.rand(3), expected[0])
+    np.testing.assert_array_equal(np.random.random(3), expected[1])
+    assert random.random() == expected[2]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an NVIDIA GPU")
+def test_cuda_checkpoint_resume(tmp_path):
+    from edge_sim_learning.experiment import train
+
+    config = ScenarioConfig.profile("smoke")
+    options = dict(
+        scenario=config,
+        workers=1,
+        frames_per_batch=8,
+        epochs=1,
+        minibatch=8,
+        eval_interval=8,
+        eval_episodes=1,
+        device="cuda",
+    )
+    train(output=tmp_path / "first", episodes=1, **options)
+    train(output=tmp_path / "resumed", episodes=2, resume=tmp_path / "first/last.pt", **options)
+    payload = torch.load(tmp_path / "resumed/last.pt", map_location="cpu", weights_only=False)
+    assert payload["experiment"]["state"]["total_frames"] == 16
+    assert payload["cuda_rng"]
+    assert all(torch.isfinite(p).all() for p in payload["policy"].parameters())
