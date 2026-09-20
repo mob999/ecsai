@@ -13,7 +13,10 @@ from edge_sim_learning.pretrain import Demonstrations, collect, distribution, fi
 from edge_sim_learning.scenario import ScenarioConfig
 
 
-def test_pretrain_to_cross_scale_head_resume(tmp_path):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_pretrain_to_cross_scale_head_resume(tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires an NVIDIA GPU")
     source = ScenarioConfig.profile("smoke").model_copy(update={"scheduler_release": "window"})
     options = dict(
         method="MAPPO-no-context",
@@ -26,6 +29,7 @@ def test_pretrain_to_cross_scale_head_resume(tmp_path):
         eval_episodes=1,
         hidden_size=32,
         initial_std=0.3,
+        device=device,
     )
     train(source, tmp_path / "teacher", **options)
     teacher = tmp_path / "teacher/last.pt"
@@ -56,8 +60,18 @@ def test_pretrain_to_cross_scale_head_resume(tmp_path):
         for i, actor in enumerate(actors):
             dist, _, _ = distribution(actor, data["observation"][:, i])
             torch.testing.assert_close(dist.log_prob(data["action"][:, i]), data["log_prob"][:, i])
-    base = fit([manifest], tmp_path / "base", epochs=1, batches_per_epoch=4, hidden_size=32)
-    fit([manifest], tmp_path / "base", epochs=2, batches_per_epoch=4, hidden_size=32, resume=True)
+    base = fit(
+        [manifest], tmp_path / "base", epochs=1, batches_per_epoch=4, hidden_size=32, device=device
+    )
+    fit(
+        [manifest],
+        tmp_path / "base",
+        epochs=2,
+        batches_per_epoch=4,
+        hidden_size=32,
+        resume=True,
+        device=device,
+    )
     assert torch.load(tmp_path / "base/last.pt", weights_only=True)["epoch"] == 2
     initial = torch.load(base, weights_only=True)["actor"]
     target = source.model_copy(update={"clusters": 3, "caches": 3})
