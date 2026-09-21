@@ -45,12 +45,29 @@ def fit(
     torch.manual_seed(seed)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    info = json.loads(Path(manifest).read_text())
+    manifests = list(manifest) if isinstance(manifest, (list, tuple)) else [manifest]
+    infos = [json.loads(Path(path).read_text()) for path in manifests]
+    info = infos[0]
     agents = info["spec"]["scenario"]["clusters"]
+    if len(manifests) > 1:
+        physical = [
+            {
+                k: v
+                for k, v in item["spec"]["scenario"].items()
+                if k not in {"request_rate", "delivery_load"}
+            }
+            for item in infos
+        ]
+        if any(item != physical[0] for item in physical):
+            raise ValueError("mixed-load distillation requires identical physical scenarios")
     arrays = {}
     for split in ("train", "validation"):
-        data = Demonstrations([manifest], split)
-        shards = [data.load(path) for path in data.sources[0]]
+        data = Demonstrations(manifests, split)
+        sources = [[data.load(path) for path in source] for source in data.sources]
+        counts = [sum(len(shard["observation"]) for shard in source) for source in sources]
+        if len(set(counts)) != 1:
+            raise ValueError("mixed loads must have equal numbers of decision steps")
+        shards = [shard for source in sources for shard in source]
         arrays[split] = tuple(
             torch.cat([s[key][..., :13] if key == "observation" else s[key] for s in shards])
             for key in ("observation", "loc", "scale")
@@ -63,7 +80,9 @@ def fit(
         action_dim=5,
         hidden_size=256,
         agents=agents,
-        manifest_sha256=sha256(manifest),
+        manifest_sha256=(
+            sha256(manifests[0]) if len(manifests) == 1 else [sha256(path) for path in manifests]
+        ),
         seed=seed,
         learning_rate=learning_rate,
         batch_size=batch_size,

@@ -58,3 +58,50 @@ def test_independent_distribution_distillation_and_resume(tmp_path):
     assert means[0] < 0 < means[1]
     with pytest.raises(ValueError, match="configuration mismatch"):
         fit(manifest, tmp_path / "resumed", epochs=13, batch_size=8, resume=True)
+
+
+def test_mixed_loads_full_epochs_and_physical_guard(tmp_path):
+    manifests = []
+    for load in [0.75, 0.875, 1.0]:
+        folder = tmp_path / str(load)
+        folder.mkdir()
+        rows = []
+        for split, seed in SPLIT_SEEDS.items():
+            shard = folder / (split + ".pt")
+            torch.save(
+                dict(
+                    observation=torch.ones(4, 2, 13) * load,
+                    loc=torch.zeros(4, 2, 5),
+                    scale=torch.full((4, 2, 5), 0.3),
+                ),
+                shard,
+            )
+            rows.append(dict(file=shard.name, sha256=sha256(shard), split=split, seed=seed))
+        manifest = folder / "manifest.json"
+        manifest.write_text(
+            json.dumps(
+                dict(
+                    spec=dict(
+                        format=FORMAT,
+                        scenario=dict(clusters=2, delivery_load=load, request_rate=400 * load),
+                        counts=dict(train=1, validation=1),
+                    ),
+                    episodes=rows,
+                )
+            )
+        )
+        manifests.append(manifest)
+    fit(manifests, tmp_path / "mixed", epochs=1, batch_size=5)
+    fit(manifests, tmp_path / "mixed", epochs=2, batch_size=5, resume=True)
+    fit(manifests, tmp_path / "direct", epochs=2, batch_size=5)
+    a = torch.load(tmp_path / "mixed/last.pt", weights_only=True)
+    b = torch.load(tmp_path / "direct/last.pt", weights_only=True)
+    assert a["history"][-1]["samples"] == 3 * 4 * 2
+    assert len(a["config"]["manifest_sha256"]) == 3
+    for left, right in zip(a["actors"], b["actors"], strict=True):
+        assert all(torch.equal(left[k], right[k]) for k in left)
+    changed = json.loads(manifests[-1].read_text())
+    changed["spec"]["scenario"]["clusters"] = 3
+    manifests[-1].write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match="physical scenarios"):
+        fit(manifests, tmp_path / "invalid", epochs=1)
