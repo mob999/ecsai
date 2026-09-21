@@ -97,3 +97,28 @@ ratio. The original strict gates are reported but no longer required by the user
 A one-episode screening interval is not meaningful uncertainty evidence. Final
 confirmation reuses development data, not an independent generalization test.
 Do not alter or weaken baseline policies, retries, requests, or resource budgets.
+
+## Selected base and paired RL transfer
+
+The user selected `deep-reg-fixed-nll`: local-context-v2, four 256-unit hidden
+layers, LayerNorm, fixed pre-tanh action standard deviation 0.1. PPO disables the
+pretraining dropout in both arms to preserve likelihood recomputation; this is
+identical to the base policy's evaluation behavior. Actor parameters are independent
+per scheduler, and the centralized critic is shared. The critic receives concatenated
+21-dimensional local observations. Both arms initialize identical critic weights.
+
+`train_context_rl_comparison.py` runs three separate scales (3/10, 5/20, 7/30),
+with pretrained and random initialization at each scale. Every scale cycles through
+loads 0.25, 0.50, 0.75, 1.00, 1.25 by episode, preserving physical capacity. The two
+arms share workload seeds and load order. The seed-0 initial budget is 65,536
+environment steps per run, 512-step batches, 2 SDK workers per run, learning rate
+1e-4, 5 PPO epochs, business reward, two retries and 100 ms retry delay.
+
+All six training jobs may run concurrently; CPU evaluation is queued. Initial and
+every-8,192-step evaluation covers all five loads using one fixed episode each,
+with stochastic actions and full retry draining. Best checkpoint selection uses
+equal-load mean logical success rate, then successful-request total latency.
+Training logs include frame counts by load. `initial.pt`, `last.pt`, optimizer and
+RNG state are saved; interrupted runs require explicit resume from their checkpoint,
+not automatic restart. These runs compare initialization, not statistical performance
+across multiple training seeds. No cross-scale RL parameter sharing is introduced.

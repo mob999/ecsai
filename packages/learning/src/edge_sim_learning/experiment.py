@@ -360,6 +360,12 @@ class RunLog(Callback):
         }
         for key, value in batch["next", "metrics"].items():
             metrics[key] = value.float().mean().item()
+        if getattr(self, "local_context", False):
+            loads = batch["next", "metrics", "delivery_load"]
+            for load in self.load_mix:
+                metrics[f"load/rho{load:g}/frames"] = (
+                    torch.isclose(loads, loads.new_tensor(load)).sum().item()
+                )
         metrics["requests_processed_s"] = (
             batch["next", "metrics", "window_resolved"].sum().item() / elapsed
         )
@@ -447,6 +453,10 @@ class RunLog(Callback):
             exp.total_frames % self.eval_interval == 0
             or exp.total_frames >= exp.config.max_n_frames
         ):
+            if getattr(self, "local_context", False):
+                self.evaluate_contextual()
+                self.checkpoint("last.pt")
+                return
             result = evaluate(
                 self.scenario,
                 self.method,
@@ -493,6 +503,54 @@ class RunLog(Callback):
                     self.best_stochastic = sampled_score
                     self.checkpoint("best-stochastic.pt")
         self.checkpoint("last.pt")
+
+    def evaluate_contextual(self, advance_iteration=True):
+        from .multiscale_bc import evaluation_slot
+
+        self.experiment.policy.observation_profile = "local-context-v2"
+        reports = {}
+        with evaluation_slot():
+            for index, load in enumerate(self.load_mix or (self.scenario.delivery_load,)):
+                cfg = self.scenario.model_copy(
+                    update={
+                        "delivery_load": load,
+                        "request_rate": self.scenario.request_rate
+                        * load
+                        / self.scenario.delivery_load,
+                    }
+                )
+                result = evaluate(
+                    cfg,
+                    self.method,
+                    self.experiment.policy,
+                    range(
+                        1_100_000_000 + index * 10000,
+                        1_100_000_000 + index * 10000 + self.eval_episodes,
+                    ),
+                    exploration="stochastic",
+                    workers=self.eval_workers,
+                )
+                reports[f"rho{load:g}"] = result
+                self.emit({f"eval/rho{load:g}/{k}": v for k, v in result["mean"].items()})
+        means = {
+            k: float(np.mean([r["mean"][k] for r in reports.values()]))
+            for k in (
+                "logical_success_rate",
+                "mean_success_e2e_s",
+                "mean_failed_elapsed_s",
+                "mean_resolution_time_s",
+                "mean_attempts",
+                "episode_return",
+            )
+        }
+        self.emit({"eval/" + k: v for k, v in means.items()})
+        path = Path(self.output) / f"evaluation-context-{self.experiment.total_frames}.json"
+        path.write_text(json.dumps(dict(mean=means, conditions=reports), indent=2))
+        score = (means["logical_success_rate"], -means["mean_success_e2e_s"])
+        if score > self.best:
+            self.best = self.best_stochastic = score
+            self.checkpoint("best.pt", advance_iteration=advance_iteration)
+            self.checkpoint("best-stochastic.pt", advance_iteration=advance_iteration)
         self.collection_started = perf_counter()
 
 
@@ -520,6 +578,8 @@ def train(
     eval_workers=1,
     actor_init=None,
     head_only=False,
+    local_context=False,
+    load_mix=(),
 ):
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -545,6 +605,10 @@ def train(
         raise ValueError("base adaptation currently supports MAPPO-no-context")
     if head_only and actor_init is None and resume is None:
         raise ValueError("head-only training requires a base actor or resumed checkpoint")
+    if local_context and (method != "MAPPO-no-context" or hidden_size != 256):
+        raise ValueError("local-context RL requires MAPPO-no-context and hidden_size=256")
+    if load_mix and (not local_context or any(x <= 0 for x in load_mix)):
+        raise ValueError("load mixture requires local-context RL and positive loads")
     if method == "DD-adapted":
         scenario = scenario.model_copy(update={"scheduler_release": "window"})
     action_dim = scenario.scheduler_capacity + 2 if method == "DD-adapted" else ACTION
@@ -592,12 +656,18 @@ def train(
         eval_stochastic,
         eval_workers,
     )
+    callback.local_context = local_context
+    callback.load_mix = tuple(load_mix)
     training_options = dict(
         normalize_advantage=normalize_advantage,
         hidden_size=hidden_size,
         context_size=context_size,
         initial_std=initial_std,
     )
+    if local_context:
+        training_options.update(
+            local_context=True, load_mix=list(load_mix), fixed_scale=0.1, rl_dropout=False
+        )
     payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
     if head_only and payload and not payload.get("training_options", {}).get("head_only", False):
         raise ValueError("resume cannot change full training into head-only adaptation")
@@ -647,18 +717,21 @@ def train(
         else 0
     )
     experiment = StableExperiment(
-        task=ContentTask(scenario, episode_start, method),
+        task=ContentTask(scenario, episode_start, method, local_context, tuple(load_mix)),
         algorithm_config=algorithm,
         model_config=ContextConfig(
             use_context=method == "DEPPO-adapted",
             input_dim=OBS + 4 * (scenario.scheduler_capacity + 1)
             if method == "DD-adapted"
+            else 21
+            if local_context
             else OBS,
             hidden_size=hidden_size,
             context_size=context_size,
             initial_std=initial_std,
             actor_init=str(Path(actor_init).resolve()) if actor_init is not None else None,
             head_only=head_only,
+            local_context=local_context,
         ),
         critic_model_config=critic,
         seed=seed,
@@ -668,6 +741,8 @@ def train(
     for loss in experiment.losses.values():
         loss.normalize_advantage = normalize_advantage
         loss.normalize_advantage_exclude_dims = (-2,)
+    if local_context:
+        experiment.policy.observation_profile = "local-context-v2"
     try:
         if resume:
             experiment.load_state_dict(payload["experiment"])
@@ -685,6 +760,13 @@ def train(
             restore_rng_states(payload)
             experiment.collector.update_policy_weights_()
         callback.checkpoint("last.pt", advance_iteration=False)
+        if local_context and not resume:
+            callback.checkpoint("initial.pt", advance_iteration=False)
+            callback.evaluate_contextual(advance_iteration=False)
+            initial_payload = torch.load(
+                output / "initial.pt", map_location="cpu", weights_only=False
+            )
+            restore_rng_states(initial_payload)
         experiment.run()
     finally:
         experiment.close()

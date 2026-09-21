@@ -14,12 +14,56 @@ from .env import SchedulingEnv
 from .scenario import ScenarioConfig
 
 
+def contextual_env(config, load_mix=(), **kwargs):
+    from .local_context import LocalContextEnv
+
+    class MixedContextEnv(LocalContextEnv):
+        def __init__(self, *args, **kwargs):
+            from gymnasium.spaces import Box
+
+            super().__init__(*args, **kwargs)
+            self.state_space = Box(-np.inf, np.inf, (21 * self.config.clusters,), np.float32)
+
+        def prepare_reset(self, seed=None):
+            generation = 0 if seed is not None else self.generation
+            if load_mix:
+                load = load_mix[(generation + self.slot) % len(load_mix)]
+                self.config = config.model_copy(
+                    update={
+                        "delivery_load": load,
+                        "request_rate": config.request_rate * load / config.delivery_load,
+                    }
+                )
+            super().prepare_reset(seed)
+
+        def state(self):
+            values = self._observations()
+            return np.concatenate([values[a] for a in self.possible_agents]).astype(np.float32)
+
+    return MixedContextEnv(config, **kwargs)
+
+
 class ContentBatchEnv(EnvBase):
-    def __init__(self, config, workers=4, seed=0, episode_start=0, method="DEPPO-adapted"):
+    def __init__(
+        self,
+        config,
+        workers=4,
+        seed=0,
+        episode_start=0,
+        method="DEPPO-adapted",
+        local_context=False,
+        load_mix=(),
+    ):
         super().__init__(device="cpu", batch_size=[workers])
         self.runner = BatchRunner(workers=workers)
         self.envs = [
-            SchedulingEnv(config, seed=seed, runner=self.runner, slot=i, method=method)
+            (
+                contextual_env(
+                    config, load_mix, seed=seed, runner=self.runner, slot=i, method=method
+                )
+                if local_context
+                else SchedulingEnv(config, seed=seed, runner=self.runner, slot=i, method=method)
+            )
             for i in range(workers)
         ]
         for env in self.envs:
@@ -49,6 +93,8 @@ class ContentBatchEnv(EnvBase):
                 "window_resolved",
             }
         )
+        if local_context:
+            self.metric_keys.append("delivery_load")
         observation = prototype.observation_spec.clone()
         observation["metrics"] = Composite({k: Unbounded(shape=(1,)) for k in self.metric_keys})
         self.observation_spec = observation.expand(workers)
@@ -100,7 +146,11 @@ class ContentBatchEnv(EnvBase):
 
     def _metrics(self, td, env):
         values = torch.tensor(
-            [env.last_metrics.get(k, 0) for k in self.metric_keys], dtype=torch.float32
+            [
+                env.config.delivery_load if k == "delivery_load" else env.last_metrics.get(k, 0)
+                for k in self.metric_keys
+            ],
+            dtype=torch.float32,
         ).split(1)
         td["metrics"] = TensorDict(
             dict(zip(self.metric_keys, values, strict=True)),
@@ -168,8 +218,11 @@ class ContentBatchEnv(EnvBase):
 
 
 class ContentTask(TaskClass):
-    def __init__(self, config, episode_start=0, method="DEPPO-adapted"):
+    def __init__(
+        self, config, episode_start=0, method="DEPPO-adapted", local_context=False, load_mix=()
+    ):
         self.method = method
+        self.local_context, self.load_mix = local_context, load_mix
         self.episode_start = episode_start
         super().__init__("content", config.model_dump())
 
@@ -177,7 +230,13 @@ class ContentTask(TaskClass):
         if str(device) != "cpu":
             raise ValueError("SimGrid sampling must use CPU")
         return lambda: ContentBatchEnv(
-            ScenarioConfig(**self.config), num_envs, seed, self.episode_start, self.method
+            ScenarioConfig(**self.config),
+            num_envs,
+            seed,
+            self.episode_start,
+            self.method,
+            self.local_context,
+            self.load_mix,
         )
 
     def supports_continuous_actions(self):

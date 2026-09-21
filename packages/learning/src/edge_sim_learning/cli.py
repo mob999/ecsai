@@ -45,6 +45,8 @@ def main():
         "--actor-init", type=Path, help="Initialize independent MAPPO actors from BC base"
     )
     p.add_argument("--head-only", action="store_true", help="Freeze pretrained actor backbone")
+    p.add_argument("--local-context", action="store_true", help="Selected 21-feature 4x256 actor")
+    p.add_argument("--load-mix", type=float, nargs="+", default=[])
     p = sub.choices["evaluate"]
     p.add_argument(
         "--method", choices=["random", "local", "forward", "queue-adaptive"], default="local"
@@ -98,6 +100,8 @@ def main():
             eval_workers=args.eval_workers,
             actor_init=args.actor_init,
             head_only=args.head_only,
+            local_context=args.local_context,
+            load_mix=args.load_mix,
         )
     elif args.command == "evaluate":
         from .experiment import evaluate, save_report

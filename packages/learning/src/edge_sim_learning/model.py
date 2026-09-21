@@ -80,11 +80,49 @@ class ContextModel(Model):
         input_dim=OBS,
         actor_init=None,
         head_only=False,
+        local_context=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         if self.centralised or self.share_params or not self.input_has_agent_dim:
             raise ValueError("DEPPO actor requires independent local agent parameters")
+        if local_context:
+            from .multiscale_bc import actor_from_config
+
+            base_config = dict(
+                hidden_size=256,
+                architecture=dict(depth=4, layer_norm=True, dropout=0.05),
+                fixed_scale=0.1,
+            )
+            if (
+                use_context
+                or input_dim != 21
+                or self.output_leaf_spec.shape[-1] != 10
+                or hidden_size != 256
+                or head_only
+            ):
+                raise ValueError("local-context RL requires the selected 4x256 five-action actor")
+            self.actors = nn.ModuleList(
+                [actor_from_config(base_config) for _ in range(self.n_agents)]
+            ).to(self.device)
+            if actor_init is not None:
+                payload = torch.load(actor_init, map_location=self.device, weights_only=True)
+                for key, value in base_config.items():
+                    if payload["config"].get(key) != value:
+                        raise ValueError(f"base actor mismatch: {key}")
+                if (
+                    payload["config"]["format"] != "edge-bc-v2"
+                    or payload["config"]["input_dim"] != 21
+                ):
+                    raise ValueError("requires local-context-v2 checkpoint")
+                for actor in self.actors:
+                    actor.load_state_dict(payload["actor"], strict=True)
+            # PPO recomputes likelihoods: disable dropout in both experimental arms.
+            for actor in self.actors:
+                for i, layer in enumerate(actor.mlp):
+                    if isinstance(layer, nn.Dropout):
+                        actor.mlp[i] = nn.Identity()
+            return
         self.actors = nn.ModuleList(
             [
                 HistoryActor(
@@ -137,6 +175,7 @@ class ContextConfig(ModelConfig):
     input_dim: int = OBS
     actor_init: str | None = None
     head_only: bool = False
+    local_context: bool = False
 
     @staticmethod
     def associated_class():
