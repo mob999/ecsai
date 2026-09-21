@@ -1,3 +1,19 @@
+# 当前执行范围：只训练新混合 base
+
+2026-09-21 用户修正：旧 base 和旧实验只作参照，不重新训练单负载 base，也不新增 scratch 训练。运行 `--mixed-only`，输出 `outputs/legacy-mixed-base-only-v1`。新 base 每档 128 个训练、32 个验证 episode，共 384/96；40 个完整 epoch。通过闭环质量检查后，仅启动三档各一个 mixed RL（seed 0，262,144 步）。最多两个 RL 并行，评估排队。数据量与旧 base 不同，高负载 RL 的训练场景也不同，因此与旧结果的比较是探索性方案比较，不是严格隔离负载覆盖的消融。
+
+旧 launcher 在采集阶段已停止，旧 base 从未被修改；已完成的 0.75 数据中首 128 个 episode 经 SHA-256 校验后复制到新目录，剩余数据留档，不浪费已经完成的有效采集。原 nightly 目录保留为 superseded，不能恢复它来启动旧计划。
+
+```sh
+.venv/bin/python scripts/run_legacy_mixed_load_trial.py \
+  --teacher outputs/legacy-independent-pretrain-v1/teacher.pt \
+  --output outputs/legacy-mixed-base-only-v1 --mixed-only --wandb-mode online
+```
+
+---
+
+以下为原设计留档，当前不执行等数据量 single / scratch 对照。
+
 # v1 三档高负载离线预训练与 RL 对照
 
 这是独立于中期 v1 结果的探索实验，保持原模型、奖励、规模和物理机制不变，不覆盖已完成的实验。

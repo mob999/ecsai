@@ -38,6 +38,11 @@ def main():
     parser.add_argument("--teacher", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scratch-reference", type=Path)
+    parser.add_argument(
+        "--mixed-only",
+        action="store_true",
+        help="Train only the new mixed-load base and its three RL runs",
+    )
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--wandb-mode", choices=["online", "offline"], default="online")
     args = parser.parse_args()
@@ -68,8 +73,9 @@ def main():
         loads=LOADS,
         mixed_train_per_load=n,
         mixed_val_per_load=val,
-        single_train=n * 3,
-        single_val=val * 3,
+        single_train=0 if args.mixed_only else n * 3,
+        single_val=0 if args.mixed_only else val * 3,
+        mixed_only=args.mixed_only,
         epochs=epochs,
         seed=0,
         rl_episodes=episodes,
@@ -106,8 +112,8 @@ def main():
         manifests[load] = collect(
             proxy,
             out / f"data-rho{load:g}",
-            train_episodes=n * 3 if load == 0.75 else n,
-            validation_episodes=val * 3 if load == 0.75 else val,
+            train_episodes=n * 3 if load == 0.75 and not args.mixed_only else n,
+            validation_episodes=val * 3 if load == 0.75 and not args.mixed_only else val,
             workers=1 if args.smoke else 4,
         )
     subset = subset_manifest(
@@ -122,10 +128,10 @@ def main():
         config=spec,
     ) as run:
         (out / "wandb.json").write_text(json.dumps({"url": run.url}))
-        for name, manifest in [
-            ("mixed", [subset, manifests[0.875], manifests[1.0]]),
-            ("single", manifests[0.75]),
-        ]:
+        fitting = [("mixed", [subset, manifests[0.875], manifests[1.0]])]
+        if not args.mixed_only:
+            fitting.append(("single", manifests[0.75]))
+        for name, manifest in fitting:
             print("DISTILL", name, flush=True)
             run.define_metric(name + "/epoch")
             run.define_metric(name + "/*", step_metric=name + "/epoch")
@@ -288,7 +294,8 @@ def main():
 
     for load, cfg in configs.items():
         (out / f"scenario-rho{load:g}.json").write_text(cfg.model_dump_json(indent=2))
-    jobs = [(load, arm) for load in LOADS for arm in ["mixed", "single", "scratch"]]
+    arms = ["mixed"] if args.mixed_only else ["mixed", "single", "scratch"]
+    jobs = [(load, arm) for load in LOADS for arm in arms]
     rows = []
     with ThreadPoolExecutor(max_workers=2) as pool:
         for load, arm, folder in pool.map(run_arm, jobs):
