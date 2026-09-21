@@ -17,10 +17,13 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--eval-at-end-only", action="store_true")
     parser.add_argument("--fresh-regularized", action="store_true")
+    parser.add_argument("--fresh", action="store_true")
+    parser.add_argument("--full-epoch", action="store_true")
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     args = parser.parse_args()
-    if args.fresh_regularized and args.resume_from:
+    fresh = args.fresh or args.fresh_regularized
+    if fresh and args.resume_from:
         parser.error("fresh training cannot resume a previous model")
     interval = args.epochs if args.eval_at_end_only else 20
     if args.workers < 1:
@@ -46,6 +49,8 @@ def main():
             seed_split="validation",
             no_new_data=True,
             fresh_regularized=args.fresh_regularized,
+            fresh=fresh,
+            full_epoch=args.full_epoch,
         ),
     )
     if (output / "status.json").exists():
@@ -56,7 +61,7 @@ def main():
         shutil.copyfile(original, initial)
     if bc.sha256(initial) != bc.sha256(original):
         raise ValueError("initial snapshot changed")
-    if not args.fresh_regularized and not (phase / "metrics.json").exists():
+    if not fresh and not (phase / "metrics.json").exists():
         shutil.copyfile(previous_phase / "metrics.json", phase / "metrics.json")
     source_spec = json.loads((source / "spec.json").read_text())
     conditions = {
@@ -72,7 +77,7 @@ def main():
         for n in conditions
     }
     selection_path = output / "selection.json"
-    if not selection_path.exists() and not args.fresh_regularized:
+    if not selection_path.exists() and not fresh:
         shutil.copyfile(previous / "selection.json", selection_path)
     best = output / "best.pt"
     if selection_path.exists():
@@ -103,7 +108,7 @@ def main():
     bc.fit_phase(
         phase,
         records,
-        None if args.fresh_regularized else initial,
+        None if fresh else initial,
         args.device,
         cfg["hidden_size"],
         args.epochs,
@@ -111,7 +116,8 @@ def main():
         cfg["batch_size"],
         interval,
         assess,
-        continue_initial=not args.fresh_regularized,
+        continue_initial=not fresh,
+        full_epoch=args.full_epoch,
         architecture=dict(depth=4, layer_norm=True, dropout=0.05)
         if args.fresh_regularized
         else None,

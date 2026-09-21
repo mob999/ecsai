@@ -60,3 +60,21 @@ Random 和原 Queue-adaptive 仍按逐请求随机转发作为基线；不伪造
 本机原有及新增回归测试通过；专门覆盖了 CPU 中断恢复后的参数逐项一致。服务器额外通过 CUDA 有限梯度和精确恢复测试。不同条件采用 spawn 隔离执行，和串行结果逐项核对；`--workers` 表示总仿真 worker 预算，达到 8/12 时分别最多并行 2/3 个条件，每条件分得 4 个 worker。数据采集直接使用该 worker 预算，不再套额外向量化。14 核服务器可用 `--workers 12`。
 
 绘图依赖固定为 matplotlib 3.11.2，锁文件保留原有所有依赖版本。W&B 继续 offline；每个训练阶段记录 NLL、梯度、标签裁剪误差和逐场景闭环业务曲线，最后附比较表及负载曲线。
+
+## Full-epoch sampling ablation
+
+`continue_multiscale_bc.py --fresh --full-epoch --eval-at-end-only` starts the
+original actor from seed 0; add `--fresh-regularized` for the four-layer actor.
+Each epoch shuffles all training agent samples without replacement, including
+any final partial batch. Loss remains action NLL. Per-sample weights preserve
+equal condition contributions despite different agent counts; within a condition
+all current episodes have the same length and agent count. Validation is unchanged.
+The optimizer, architecture, dropout and weight decay remain those of each model's
+previous run. Checkpoints preserve the shuffle generator and model RNG states.
+
+The 153,600-sample dataset at batch size 512 gives 300 updates per full epoch.
+The initial comparison uses 43 epochs for the original actor (12,900 updates,
+versus the previous 12,800), and 64 for the regularized actor (19,200 updates,
+exactly matching its previous run). Do not compare epoch numbers as equal compute.
+W&B records updates and samples seen. Both runs evaluate the same 15 conditions
+only after training; no new data, objective changes or RL are involved.

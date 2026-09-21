@@ -286,7 +286,10 @@ def test_collector_teacher_matches_baseline_execution(tmp_path, teacher):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("regularized", [False, True])
-def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device, regularized):
+@pytest.mark.parametrize("full_epoch", [False, True])
+def test_interrupted_evaluation_resumes_exact_training_state(
+    tmp_path, device, regularized, full_epoch
+):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires NVIDIA GPU")
     cfg = config()
@@ -319,6 +322,7 @@ def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device, r
         if regularized
         else {}
     )
+    options["full_epoch"] = full_epoch
     fit_phase(tmp_path / "reference", *args, ok, **options)
     with pytest.raises(RuntimeError, match="simulated"):
         fit_phase(tmp_path / "resumed", *args, interrupt, **options)
@@ -330,6 +334,39 @@ def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device, r
     policy = policy_from_payload(b)
     assert all(not m.training for m in policy.modules() if isinstance(m, torch.nn.Dropout))
     assert all(torch.isfinite(v).all() for v in b["actor"].values())
+    if full_epoch:
+        import json
+        import math
+
+        count = len(BalancedData(records, "train").full_data()[0])
+        rows = json.loads((tmp_path / "resumed/metrics.json").read_text())
+        assert all(r["samples_this_epoch"] == count for r in rows)
+        assert rows[-1]["updates"] == 2 * math.ceil(count / 16)
+
+
+def test_full_data_preserves_samples_and_equal_condition_weights(tmp_path):
+    import edge_sim_learning.multiscale_bc as bc
+
+    records = []
+    for name, count in [("small", 3), ("large", 7)]:
+        path = tmp_path / f"{name}.pt"
+        torch.save(
+            dict(
+                format=bc.FORMAT,
+                observation=torch.full((count, 1, 21), float(count)),
+                teacher_action=torch.zeros(count, 1, 5),
+            ),
+            path,
+        )
+        records.append(
+            dict(condition=name, seed=1, split="train", file=str(path), sha256=bc.sha256(path))
+        )
+    obs, labels, weights = BalancedData(records, "train").full_data()
+    assert len(obs) == len(labels) == len(weights) == 10
+    assert (obs[:, 0] == 3).sum() == 3
+    assert (obs[:, 0] == 7).sum() == 7
+    for count in (3, 7):
+        assert weights[obs[:, 0] == count].sum().item() == pytest.approx(5)
 
 
 def test_parallel_conditions_match_serial(tmp_path):

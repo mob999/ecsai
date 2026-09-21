@@ -479,6 +479,22 @@ class BalancedData:
                 scores.append(total / count)
         return float(np.mean(scores))
 
+    def full_data(self):
+        """Visit every sample once; retain equal-condition weighting in the loss."""
+        observations, targets, weights = [], [], []
+        for name in self.names:
+            obs, labels = [], []
+            for path in self.groups[name]:
+                data = self.load(path)
+                obs.append(data["observation"].reshape(-1, CONTEXT_DIM))
+                labels.append(data["teacher_action"].reshape(-1, 5))
+            obs, labels = torch.cat(obs), torch.cat(labels)
+            observations.append(obs)
+            targets.append(labels)
+            weights.append(torch.full((len(obs),), 1 / (len(self.names) * len(obs))))
+        observations = torch.cat(observations)
+        return observations, torch.cat(targets), torch.cat(weights) * len(observations)
+
 
 def fit_phase(
     folder,
@@ -494,6 +510,7 @@ def fit_phase(
     continue_initial=False,
     architecture=None,
     weight_decay=0.0,
+    full_epoch=False,
 ):
     import wandb
 
@@ -516,11 +533,15 @@ def fit_phase(
     if architecture is not None:
         config["architecture"] = architecture
         config["weight_decay"] = weight_decay
+    if full_epoch:
+        config["sampling"] = "full-shuffle-condition-weighted"
     if continue_initial:
         if initial is None:
             raise ValueError("continuation requires an initial checkpoint")
         config["continue_initial"] = True
         original = torch.load(initial, map_location="cpu", weights_only=True)
+        if original["config"].get("sampling") != config.get("sampling"):
+            raise ValueError("continuation changed sampling")
         if original["config"].get("architecture") != config.get("architecture"):
             raise ValueError("continuation changed architecture")
         if original["config"].get("weight_decay", 0.0) != weight_decay:
@@ -549,6 +570,8 @@ def fit_phase(
     )
     if train.names != validation.names:
         raise ValueError("missing validation condition")
+    full = train.full_data() if full_epoch else None
+    steps_per_epoch = math.ceil(len(full[0]) / batch_size) if full_epoch else batches
     torch.manual_seed(0)
     actor = actor_from_config(config).to(device)
     optimizer = (
@@ -611,11 +634,18 @@ def fit_phase(
         for epoch in range(start + 1, epochs + 1):
             actor.train()
             losses, label_errors, norms = [], [], []
-            for _ in range(batches):
-                obs, labels = [v.to(device) for v in train.sample(batch_size, generator)]
+            order = torch.randperm(len(full[0]), generator=generator) if full_epoch else None
+            sizes = []
+            for batch in range(steps_per_epoch):
+                if full_epoch:
+                    indices = order[batch * batch_size : (batch + 1) * batch_size]
+                    obs, labels, weights = [v[indices].to(device) for v in full]
+                else:
+                    obs, labels = [v.to(device) for v in train.sample(batch_size, generator)]
+                    weights = 1.0
                 target = safe_actions(labels)
                 label_errors.append((labels - target).abs().max().item())
-                loss = -distribution(actor, obs)[0].log_prob(target).mean()
+                loss = (-distribution(actor, obs)[0].log_prob(target) * weights).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("non-finite NLL; last.pt retains previous full epoch")
                 optimizer.zero_grad()
@@ -627,17 +657,22 @@ def fit_phase(
                 if not all(torch.isfinite(p).all() for p in actor.parameters()):
                     raise FloatingPointError("non-finite actor parameter")
                 losses.append(loss.item())
+                sizes.append(len(obs))
                 norms.append(norm.item())
             actor.eval()
             row = dict(
                 epoch=epoch,
-                updates=epoch * batches,
-                train_nll=float(np.mean(losses)),
+                updates=epoch * steps_per_epoch,
+                train_nll=float(np.average(losses, weights=sizes)),
                 validation_nll=validation.validation_nll(actor, device),
                 label_max_abs_error=max(label_errors),
                 gradient_norm=float(np.mean(norms)),
                 wall_s=previous_wall + perf_counter() - started,
             )
+            if full_epoch:
+                row["samples_this_epoch"] = sum(sizes)
+                row["samples_seen"] = epoch * sum(sizes)
+                row["updates_per_epoch"] = steps_per_epoch
             if not all(math.isfinite(v) for v in row.values()):
                 raise FloatingPointError("non-finite training diagnostics")
             if epoch % interval == 0:
