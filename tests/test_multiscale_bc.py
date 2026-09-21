@@ -405,3 +405,20 @@ def test_parallel_conditions_match_serial(tmp_path):
                 assert a["mean"][key] == pytest.approx(b["mean"][key])
     finally:
         bc.EVAL_WORKERS = old
+
+
+def test_evaluation_slot_excludes_other_process_locks_and_releases(monkeypatch, tmp_path):
+    import fcntl
+
+    from edge_sim_learning.multiscale_bc import evaluation_slot
+
+    path = tmp_path / "eval.lock"
+    monkeypatch.setenv("BC_EVAL_LOCK", str(path))
+    with path.open("a") as other:
+        with pytest.raises(RuntimeError, match="simulated"):
+            with evaluation_slot():
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise RuntimeError("simulated evaluation failure")
+        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(other, fcntl.LOCK_UN)

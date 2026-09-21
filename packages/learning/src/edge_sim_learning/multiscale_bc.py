@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import shutil
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from time import perf_counter
 
@@ -225,6 +226,25 @@ def cached_evaluate(folder, cfg, seed_list, method="local", ratio=None, checkpoi
 
 
 EVAL_WORKERS = 1
+
+
+@contextmanager
+def evaluation_slot():
+    """Queue independent GPU training runs behind one CPU evaluation slot."""
+    path = os.environ.get("BC_EVAL_LOCK")
+    if not path:
+        yield
+        return
+    import fcntl
+
+    with open(path, "a") as lock:
+        print("EVAL_QUEUE waiting", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            print("EVAL_QUEUE acquired", flush=True)
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _evaluation_job(job):

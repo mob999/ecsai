@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from edge_sim_learning import multiscale_bc as bc
@@ -49,7 +50,9 @@ def main():
         ),
     )
     screens = {}
-    for name, model, flags in variants:
+
+    def execute(variant):
+        name, model, flags = variant
         dest = output / name
         cmd = [
             sys.executable,
@@ -73,18 +76,29 @@ def main():
         if model == "deep-reg":
             cmd.append("--fresh-regularized")
         cmd += flags
-        with (output / f"{name}.log").open("a") as log:
-            subprocess.run(
-                cmd,
-                env=dict(os.environ, WANDB_MODE="online", WANDB_NAME="BC-search-" + name),
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=True,
-            )
+        if not (dest / "status.json").exists():
+            with (output / f"{name}.log").open("a") as log:
+                subprocess.run(
+                    cmd,
+                    env=dict(
+                        os.environ,
+                        WANDB_MODE="online",
+                        WANDB_NAME="BC-search-" + name,
+                        BC_EVAL_LOCK=str(output / "evaluation.lock"),
+                    ),
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=True,
+                )
         report = json.loads((dest / "evaluations/continued-epoch-20/comparison.json").read_text())
-        screens[name] = dict(score=score(report), checkpoint=str(dest / "continued/last.pt"))
-        bc.write_json(output / "screening.json", screens)
-        print("SCREEN", name, screens[name]["score"], flush=True)
+        return name, dict(score=score(report), checkpoint=str(dest / "continued/last.pt"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for future in as_completed([pool.submit(execute, variant) for variant in variants]):
+            name, report = future.result()
+            screens[name] = report
+            bc.write_json(output / "screening.json", screens)
+            print("SCREEN", name, screens[name]["score"], flush=True)
     conditions = {
         n: bc.ScenarioConfig.model_validate(c)
         for n, c in json.loads((source / "spec.json").read_text())["conditions"].items()

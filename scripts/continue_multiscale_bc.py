@@ -106,9 +106,10 @@ def main():
             shutil.copyfile(selected["checkpoint"], best)
 
     def assess(checkpoint, tag):
-        report = bc.compare_conditions(
-            output, conditions, checkpoint, baselines, "validation", args.eval_episodes, tag
-        )
+        with bc.evaluation_slot():
+            report = bc.compare_conditions(
+                output, conditions, checkpoint, baselines, "validation", args.eval_episodes, tag
+            )
         old = json.loads(selection_path.read_text()) if selection_path.exists() else None
         if old is None or tuple(report["rank"]) < tuple(old["rank"]):
             temporary = best.with_suffix(".tmp")
