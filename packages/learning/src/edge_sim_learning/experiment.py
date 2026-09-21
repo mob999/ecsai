@@ -103,7 +103,14 @@ def _evaluate_serial(
     seeds = list(seeds if seeds is not None else range(1_000_000_000, 1_000_000_010))
     if not seeds:
         raise ValueError("at least one evaluation episode is required")
-    if policy is None and method not in {"random", "local", "forward", "queue-adaptive"}:
+    if policy is None and method not in {
+        "random",
+        "local",
+        "forward",
+        "queue-adaptive",
+        "local-adaptive",
+        "forward-adaptive",
+    }:
         raise ValueError("learned evaluation requires a policy")
     episodes = []
     if policy is not None:
@@ -111,7 +118,12 @@ def _evaluate_serial(
     for seed in seeds:
         if exploration == "stochastic":
             torch.manual_seed(seed)
-        env = SchedulingEnv(config, evaluation=True, method=method)
+        env_type = SchedulingEnv
+        if getattr(policy, "observation_profile", None) == "local-context-v2":
+            from .local_context import LocalContextEnv
+
+            env_type = LocalContextEnv
+        env = env_type(config, evaluation=True, method=method)
         started = perf_counter()
         inference_s = 0
         inference_calls = 0
@@ -151,12 +163,13 @@ def _evaluate_serial(
 
             def rule_actions(_, env=env, rng=rng):
                 action = np.tile(
-                    [0, 0, 0, -5 if method == "local" else 5, 0.5], (config.clusters, 1)
+                    [0, 0, 0, -5 if method in {"local", "local-adaptive"} else 5, 0.5],
+                    (config.clusters, 1),
                 ).astype(np.float32)
                 if method == "random" and fixed_ratio is None:
                     action[:, 4] = rng.uniform(0.4, 0.6, config.clusters)
-                if method == "queue-adaptive":
-                    # Same per-request Bernoulli forwarding as Random, only allocation differs.
+                if method in {"queue-adaptive", "local-adaptive", "forward-adaptive"}:
+                    # Allocation is independent of the selected forwarding rule.
                     for i, agent in enumerate(env.possible_agents):
                         pools = [
                             p for p in env.last_view.pools if env.cache_clusters[p.node_id] == agent

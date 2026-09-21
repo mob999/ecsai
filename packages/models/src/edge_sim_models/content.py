@@ -45,6 +45,7 @@ class ContentRequest(DTO):
 
 class ContentServiceSpec(DTO):
     origin: Identifier
+    report_arrivals: bool = False
     max_retries: Count = 0
     retry_delay_s: Seconds = 0.1
     bandwidth_mode: Literal["independent", "shared"] = "independent"
@@ -169,6 +170,13 @@ class LinkCounter(DTO):
     capacity_byte_seconds: NonNegativeFloat
 
 
+class ContentArrivalState(DTO):
+    request_id: Identifier
+    cluster_id: Identifier
+    arrival_s: Seconds
+    size_bytes: Bytes
+
+
 class ContentView(DTO):
     # Scheduling snapshots retain all counters/pools but include only queued
     # scheduler requests and omit transfer details. Window-release snapshots also
@@ -192,6 +200,8 @@ class ContentView(DTO):
     latencies_s: tuple[Seconds, ...] = ()
     # Retry-enabled runs expose completed attempts, including failures, per window.
     attempt_outcomes: tuple[ContentRequestState, ...] = ()
+    # Actual original/retry arrivals in the last control window, never future requests.
+    window_arrivals: tuple[ContentArrivalState, ...] = ()
 
 
 class WindowResult(DTO):

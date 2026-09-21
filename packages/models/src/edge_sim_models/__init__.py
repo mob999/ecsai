@@ -293,6 +293,7 @@ class PolicySpec(DTO):
 # Content contracts depend only on the primitive DTO types defined above.
 from .content import (  # noqa: E402
     CacheNodeSpec,
+    ContentArrivalState,
     ContentRequest,
     ContentRequestState,
     ContentServiceSpec,
@@ -616,6 +617,7 @@ __all__ = [
     "CacheNodeSpec",
     "ContentRequest",
     "ContentRequestState",
+    "ContentArrivalState",
     "ContentServiceSpec",
     "ContentTransferState",
     "ContentView",

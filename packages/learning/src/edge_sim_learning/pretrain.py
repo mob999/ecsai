@@ -53,6 +53,10 @@ def load_base_policy(path):
     """Same local student for any agent count, with the BenchMARL action transform."""
     payload = torch.load(path, map_location="cpu", weights_only=True)
     config = payload["config"]
+    if config["format"] == "edge-bc-v2":
+        from .multiscale_bc import policy_from_payload
+
+        return policy_from_payload(payload)
     if config["format"] != FORMAT or config["input_dim"] != OBS or config["action_dim"] != ACTION:
         raise ValueError("unknown base actor contract")
     actor = HistoryActor(use_context=False, hidden_size=config["hidden_size"])

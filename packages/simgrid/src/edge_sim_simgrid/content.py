@@ -14,6 +14,7 @@ from time import perf_counter
 
 import simgrid as sg
 from edge_sim_models import (
+    ContentArrivalState,
     ContentRequestState,
     ContentTransferState,
     ContentView,
@@ -78,6 +79,7 @@ class ContentRuntime:
         self.deadlines = []
         self.live = set()
         self.changed = set()
+        self.window_arrivals = []
         self.schedulers = {s.id: s for s in self.spec.schedulers}
         self.queues = {s.id: deque() for s in self.spec.schedulers}
         self.busy = {}
@@ -506,6 +508,7 @@ class ContentRuntime:
                     break
                 self.arrival_index += 1
                 self.counts["arrived"] += 1
+                self._record_arrival(spec)
                 self.live.add(spec.id)
                 heapq.heappush(self.deadlines, (spec.deadline_s, spec.id))
                 self.emit("request_arrived", spec.id)
@@ -519,6 +522,7 @@ class ContentRuntime:
                 _, _, rid = heapq.heappop(self.retry_arrivals)
                 spec = self.requests[rid].spec
                 self.counts["arrived"] += 1
+                self._record_arrival(spec)
                 self.live.add(rid)
                 heapq.heappush(self.deadlines, (spec.deadline_s, rid))
                 self.emit("request_arrived", rid)
@@ -535,6 +539,18 @@ class ContentRuntime:
             cap = self._pool_spec(key).max_active
             while queue and (cap is None or len(self.active[key]) < cap):
                 self._start(queue.popleft())
+
+    def _record_arrival(self, spec):
+        if not self.spec.report_arrivals:
+            return
+        self.window_arrivals.append(
+            ContentArrivalState(
+                request_id=spec.id,
+                cluster_id=spec.cluster_id,
+                arrival_s=spec.arrival_s,
+                size_bytes=self.artifacts[spec.artifact_id].size_bytes,
+            )
+        )
 
     def _wait(self, date):
         if self.activities:
@@ -598,6 +614,7 @@ class ContentRuntime:
         }
         start, before, link_before = self.now, self.counts.copy(), self.link_bytes.copy()
         self.changed.clear()
+        self.window_arrivals.clear()
         if self.run.trace:
             self.command_log.append((start, until_s, control))
         while self.now < until_s:
@@ -646,6 +663,7 @@ class ContentRuntime:
         if selected - self.requests.keys():
             raise CommandError("unknown_request", "unknown content request")
         return ContentView(
+            window_arrivals=tuple(self.window_arrivals),
             scope=scope,
             now_s=self.now,
             schedulers=tuple(
