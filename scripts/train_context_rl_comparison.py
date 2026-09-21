@@ -26,6 +26,7 @@ def main():
             base_sha256=sha256(base),
             scales=["small", "medium", "large"],
             loads=[0.25, 0.5, 0.75, 1, 1.25],
+            load_schedule="within-episode",
             seed=0,
             env_steps=65536,
             workers_per_run=2,

@@ -24,23 +24,14 @@ def contextual_env(config, load_mix=(), **kwargs):
             super().__init__(*args, **kwargs)
             self.state_space = Box(-np.inf, np.inf, (21 * self.config.clusters,), np.float32)
 
-        def prepare_reset(self, seed=None):
-            generation = 0 if seed is not None else self.generation
-            if load_mix:
-                load = load_mix[(generation + self.slot) % len(load_mix)]
-                self.config = config.model_copy(
-                    update={
-                        "delivery_load": load,
-                        "request_rate": config.request_rate * load / config.delivery_load,
-                    }
-                )
-            super().prepare_reset(seed)
-
         def state(self):
             values = self._observations()
             return np.concatenate([values[a] for a in self.possible_agents]).astype(np.float32)
 
-    return MixedContextEnv(config, **kwargs)
+    return MixedContextEnv(
+        config.model_copy(update={"episode_loads": tuple(load_mix)}) if load_mix else config,
+        **kwargs,
+    )
 
 
 class ContentBatchEnv(EnvBase):
@@ -147,7 +138,16 @@ class ContentBatchEnv(EnvBase):
     def _metrics(self, td, env):
         values = torch.tensor(
             [
-                env.config.delivery_load if k == "delivery_load" else env.last_metrics.get(k, 0)
+                next(
+                    (
+                        load
+                        for start, end, load, _ in env.config.load_phases()
+                        if start <= max(0, np.nextafter(env.last_view.now_s, -np.inf)) < end
+                    ),
+                    env.config.load_phases()[-1][2],
+                )
+                if k == "delivery_load"
+                else env.last_metrics.get(k, 0)
                 for k in self.metric_keys
             ],
             dtype=torch.float32,

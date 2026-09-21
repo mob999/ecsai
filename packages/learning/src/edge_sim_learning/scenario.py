@@ -32,6 +32,7 @@ class ScenarioConfig(BaseModel):
     clusters: int = Field(default=3, ge=2)
     caches: int = Field(default=10, ge=2)
     request_rate: float = Field(default=300, gt=0)
+    episode_loads: tuple[float, ...] = ()
     catalog_size: int = Field(default=1000, ge=1)
     zipf_alpha: float = Field(default=1, gt=0)
     min_size: int = Field(default=500_000, ge=1)
@@ -55,6 +56,26 @@ class ScenarioConfig(BaseModel):
     scheduler_service_s: float = Field(default=0.001, gt=0)
     max_retries: int = Field(default=0, ge=0)
     retry_delay_s: float = Field(default=0.1, ge=0)
+
+    def load_phases(self):
+        loads = self.episode_loads or (self.delivery_load,)
+        if len(loads) > self.cycles or any(x <= 0 for x in loads):
+            raise ValueError("episode loads must be positive with at least one cycle per phase")
+        return [
+            (
+                i * self.cycles // len(loads) * self.period_s,
+                (i + 1) * self.cycles // len(loads) * self.period_s,
+                load,
+                self.request_rate * load / self.delivery_load,
+            )
+            for i, load in enumerate(loads)
+        ]
+
+    def expected_arrivals(self, start_s, end_s):
+        return sum(
+            max(0, min(end_s, end) - max(start_s, start)) * rate
+            for start, end, _, rate in self.load_phases()
+        )
 
     @classmethod
     def profile(cls, name):
@@ -180,23 +201,25 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         )
     popularity = np.arange(1, config.catalog_size + 1, dtype=float) ** -config.zipf_alpha
     popularity /= popularity.sum()
-    requests, now = [], 0.0
-    while True:
-        now += float(arrivals.exponential(1 / config.request_rate))
-        if now >= config.horizon_s:
-            break
-        cluster = int(arrivals.integers(config.clusters))
-        aid = int(arrivals.choice(config.catalog_size, p=popularity))
-        requests.append(
-            ContentRequest(
-                id=f"r-{len(requests)}",
-                artifact_id=f"object-{aid}",
-                cluster_id=f"cluster-{cluster}",
-                receiver=f"users-{cluster}",
-                arrival_s=now,
-                deadline_s=now + config.deadline_s,
+    requests = []
+    for start, end, _, rate in config.load_phases():
+        now = start
+        while True:
+            now += float(arrivals.exponential(1 / rate))
+            if now >= end:
+                break
+            cluster = int(arrivals.integers(config.clusters))
+            aid = int(arrivals.choice(config.catalog_size, p=popularity))
+            requests.append(
+                ContentRequest(
+                    id=f"r-{len(requests)}",
+                    artifact_id=f"object-{aid}",
+                    cluster_id=f"cluster-{cluster}",
+                    receiver=f"users-{cluster}",
+                    arrival_s=now,
+                    deadline_s=now + config.deadline_s,
+                )
             )
-        )
     run = RunSpec(
         run_id=run_id,
         seed=seed,
@@ -219,9 +242,14 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
             deadline_scale_s=config.deadline_s,
         ),
     )
+    effective_rate = (
+        config.expected_arrivals(0, config.horizon_s) / config.horizon_s
+        if config.episode_loads
+        else config.request_rate
+    )
     metadata = {
         "expected_delivery_load": float(
-            config.request_rate
+            effective_rate
             * (sizes * popularity).sum()
             / (
                 capacities.sum()
@@ -234,7 +262,7 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         if config.bandwidth_mode == "shared"
         else sum(link.bandwidth_bytes_s for link in links),
         "expected_backhaul_load_cold": float(
-            config.request_rate
+            effective_rate
             * (sizes * popularity).sum()
             / (
                 capacities.sum()
@@ -246,4 +274,9 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         "seed": seed,
         "synthetic": True,
     }
+    if config.episode_loads:
+        metadata["load_phases"] = [
+            dict(start_s=start, end_s=end, load=load, arrival_rate=rate)
+            for start, end, load, rate in config.load_phases()
+        ]
     return run, metadata

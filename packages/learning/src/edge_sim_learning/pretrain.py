@@ -190,7 +190,7 @@ def collect(teacher, output, train_episodes=128, validation_episodes=32, workers
     spec = {
         "format": FORMAT,
         "teacher_sha256": sha256(teacher),
-        "scenario": source["scenario"],
+        "scenario": json.loads(json.dumps(source["scenario"])),
         "teacher_frames": source["experiment"]["state"]["total_frames"],
         "counts": {"train": train_episodes, "validation": validation_episodes},
         "seed_bases": SPLIT_SEEDS,

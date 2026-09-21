@@ -109,13 +109,15 @@ per scheduler, and the centralized critic is shared. The critic receives concate
 
 `train_context_rl_comparison.py` runs three separate scales (3/10, 5/20, 7/30),
 with pretrained and random initialization at each scale. Every scale cycles through
-loads 0.25, 0.50, 0.75, 1.00, 1.25 by episode, preserving physical capacity. The two
+loads 0.25, 0.50, 0.75, 1.00, 1.25 within every episode, preserving physical capacity.
+Phase changes do not reset caches, queues, active transfers or request deadlines.
+Only the piecewise Poisson arrival rate changes; the existing base is retained. The two
 arms share workload seeds and load order. The seed-0 initial budget is 65,536
 environment steps per run, 512-step batches, 2 SDK workers per run, learning rate
 1e-4, 5 PPO epochs, business reward, two retries and 100 ms retry delay.
 
 All six training jobs may run concurrently; CPU evaluation is queued. Initial and
-every-8,192-step evaluation covers all five loads using one fixed episode each,
+every-8,192-step evaluation uses one fixed episode containing all five loads,
 with stochastic actions and full retry draining. Best checkpoint selection uses
 equal-load mean logical success rate, then successful-request total latency.
 Training logs include frame counts by load. `initial.pt`, `last.pt`, optimizer and

@@ -193,6 +193,24 @@ def _evaluate_serial(
                 if policy is None and method in {"random", "queue-adaptive"}
                 else "threshold",
             )
+            if config.episode_loads and config.max_retries:
+                outcomes = {r["request_id"]: r for r in env.retry_records()}
+                for index, (start, end, load, _) in enumerate(config.load_phases()):
+                    rows = [
+                        outcomes[r.id]
+                        for r in env.run.content.requests
+                        if start <= r.arrival_s < end
+                    ]
+                    succeeded = [r for r in rows if r["status"] == "SUCCEEDED"]
+                    prefix = f"phase_{index}_rho{load:g}/"
+                    metrics[prefix + "requests"] = len(rows)
+                    metrics[prefix + "logical_success_rate"] = len(succeeded) / max(1, len(rows))
+                    metrics[prefix + "mean_success_e2e_s"] = sum(
+                        r["total_elapsed_s"] for r in succeeded
+                    ) / max(1, len(succeeded))
+                    metrics[prefix + "mean_resolution_time_s"] = sum(
+                        r["total_elapsed_s"] for r in rows
+                    ) / max(1, len(rows))
             episodes.append(
                 metrics
                 | ({"retry_outcomes": env.retry_records()} if config.max_retries else {})
@@ -510,13 +528,10 @@ class RunLog(Callback):
         self.experiment.policy.observation_profile = "local-context-v2"
         reports = {}
         with evaluation_slot():
-            for index, load in enumerate(self.load_mix or (self.scenario.delivery_load,)):
+            for index, _load in enumerate((self.scenario.delivery_load,)):
                 cfg = self.scenario.model_copy(
                     update={
-                        "delivery_load": load,
-                        "request_rate": self.scenario.request_rate
-                        * load
-                        / self.scenario.delivery_load,
+                        "episode_loads": self.load_mix,
                     }
                 )
                 result = evaluate(
@@ -530,8 +545,8 @@ class RunLog(Callback):
                     exploration="stochastic",
                     workers=self.eval_workers,
                 )
-                reports[f"rho{load:g}"] = result
-                self.emit({f"eval/rho{load:g}/{k}": v for k, v in result["mean"].items()})
+                reports["within-episode"] = result
+                self.emit({f"eval/within-episode/{k}": v for k, v in result["mean"].items()})
         means = {
             k: float(np.mean([r["mean"][k] for r in reports.values()]))
             for k in (
@@ -666,7 +681,11 @@ def train(
     )
     if local_context:
         training_options.update(
-            local_context=True, load_mix=list(load_mix), fixed_scale=0.1, rl_dropout=False
+            local_context=True,
+            load_mix=list(load_mix),
+            fixed_scale=0.1,
+            rl_dropout=False,
+            load_schedule="within-episode",
         )
     payload = torch.load(resume, map_location=device, weights_only=False) if resume else None
     if head_only and payload and not payload.get("training_options", {}).get("head_only", False):

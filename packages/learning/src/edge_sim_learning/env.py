@@ -283,7 +283,12 @@ class SchedulingEnv(ParallelEnv):
             - response.timed_out
             - response.rejected
             - 0.1 * sum(response.view.latencies_s) / self.config.deadline_s
-        ) / max(1, self.config.request_rate * self.config.period_s)
+        ) / max(
+            1,
+            self.config.expected_arrivals(self.elapsed - self.config.period_s, self.elapsed)
+            if self.config.episode_loads
+            else self.config.request_rate * self.config.period_s,
+        )
         reward = paper_reward if self.config.reward_mode == "paper" else business_reward
         reward *= self.config.reward_scale
         self.episode_return += reward

@@ -15,7 +15,7 @@ from edge_sim_learning.torch_env import ContentBatchEnv
 
 
 def test_context_load_cycle_and_state():
-    cfg = ScenarioConfig.profile("smoke").model_copy(update={"cycles": 2, "max_retries": 2})
+    cfg = ScenarioConfig.profile("smoke").model_copy(update={"cycles": 10, "max_retries": 2})
     env = ContentBatchEnv(
         cfg,
         workers=1,
@@ -26,15 +26,18 @@ def test_context_load_cycle_and_state():
     try:
         seen = []
         capacities = []
-        for _ in range(5):
+        for _ in range(2):
             td = env.reset()
-            seen.append(env.envs[0].config.delivery_load)
+            seen = []
+            session = env.envs[0].session
             capacities.append([c.total_bandwidth_bytes_s for c in env.envs[0].run.content.caches])
             assert td["agents", "observation"].shape[-1] == 21
             assert td["state"].shape[-1] == 21 * cfg.clusters
-            for _ in range(2):
+            for _ in range(10):
                 td = env.step(env.rand_action(td))["next"]
-        assert sorted(seen) == [0.25, 0.5, 0.75, 1, 1.25]
+                seen.append(round(td["metrics", "delivery_load"].item(), 2))
+                assert env.envs[0].session is session
+            assert seen == [0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1, 1, 1.25, 1.25]
         assert all(x == capacities[0] for x in capacities)
     finally:
         env.close()
@@ -103,7 +106,29 @@ def test_context_pretrained_vs_scratch_update_and_resume(tmp_path):
         for k, v in actors(last)[0].state_dict().items()
     )
     report = json.loads((tmp_path / "pretrained/evaluation-context-8.json").read_text())
-    assert set(report["conditions"]) == {"rho0.25", "rho1.25"}
+    assert set(report["conditions"]) == {"within-episode"}
     train(cfg, tmp_path / "resumed", episodes=4, resume=tmp_path / "pretrained/last.pt", **opts)
     resumed = torch.load(tmp_path / "resumed/last.pt", weights_only=False)
     assert resumed["experiment"]["state"]["total_frames"] == 16
+
+
+def test_piecewise_poisson_rates_and_capacity_are_reproducible():
+    from edge_sim_learning.scenario import build_run
+
+    base = ScenarioConfig.profile("smoke").model_copy(update={"cycles": 50, "request_rate": 1000})
+    cfg = base.model_copy(update={"episode_loads": (0.25, 0.5, 0.75, 1, 1.25)})
+    dynamic, metadata = build_run(cfg, 123)
+    repeated, same = build_run(cfg, 123)
+    static, _ = build_run(base, 123)
+    assert dynamic.content.requests == repeated.content.requests
+    assert metadata == same
+    assert [c.total_bandwidth_bytes_s for c in dynamic.content.caches] == [
+        c.total_bandwidth_bytes_s for c in static.content.caches
+    ]
+    assert len(metadata["load_phases"]) == 5
+    for start, end, load, rate in cfg.load_phases():
+        count = sum(start <= r.arrival_s < end for r in dynamic.content.requests)
+        assert abs(count - rate * (end - start)) < 0.25 * rate * (end - start)
+        assert rate == pytest.approx(base.request_rate * load / base.delivery_load)
+        assert cfg.expected_arrivals(start, end) == pytest.approx(rate * (end - start))
+    assert cfg.expected_arrivals(0.9, 1.1) == pytest.approx(100)
