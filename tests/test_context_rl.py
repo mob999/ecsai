@@ -14,14 +14,15 @@ from edge_sim_learning.scenario import ScenarioConfig
 from edge_sim_learning.torch_env import ContentBatchEnv
 
 
-def test_context_load_cycle_and_state():
+@pytest.mark.parametrize("loads", [(0.25, 0.5, 0.75, 1, 1.25), (0.75,)])
+def test_context_load_cycle_and_state(loads):
     cfg = ScenarioConfig.profile("smoke").model_copy(update={"cycles": 10, "max_retries": 2})
     env = ContentBatchEnv(
         cfg,
         workers=1,
         method="MAPPO-no-context",
         local_context=True,
-        load_mix=(0.25, 0.5, 0.75, 1, 1.25),
+        load_mix=loads,
     )
     try:
         seen = []
@@ -37,7 +38,7 @@ def test_context_load_cycle_and_state():
                 td = env.step(env.rand_action(td))["next"]
                 seen.append(round(td["metrics", "delivery_load"].item(), 2))
                 assert env.envs[0].session is session
-            assert seen == [0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1, 1, 1.25, 1.25]
+            assert seen == [load for load in loads for _ in range(10 // len(loads))]
         assert all(x == capacities[0] for x in capacities)
     finally:
         env.close()

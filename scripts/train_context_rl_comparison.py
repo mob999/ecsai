@@ -16,7 +16,14 @@ def main():
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--base", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--scales", nargs="+", choices=["small", "medium", "large"],
+                   default=["small", "medium", "large"])
+    p.add_argument("--loads", nargs="+", type=float, default=[0.25, 0.5, 0.75, 1, 1.25])
+    p.add_argument("--run-tag", default="")
+    p.add_argument("--evaluation-lock", type=Path)
     args = p.parse_args()
+    if any(load <= 0 for load in args.loads) or len(set(args.scales)) != len(args.scales):
+        p.error("loads must be positive and scales must be unique")
     source, base, output = args.source.resolve(), args.base.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     spec = json.loads((source / "spec.json").read_text())
@@ -24,13 +31,13 @@ def main():
         output / "comparison-spec.json",
         dict(
             base_sha256=sha256(base),
-            scales=["small", "medium", "large"],
-            loads=[0.25, 0.5, 0.75, 1, 1.25],
-            load_schedule="within-episode",
+            scales=args.scales,
+            loads=args.loads,
+            load_schedule="fixed" if len(args.loads) == 1 else "within-episode",
             seed=0,
             env_steps=65536,
             workers_per_run=2,
-            training_concurrency=6,
+            training_concurrency=2 * len(args.scales),
             evaluation_concurrency=1,
             reward="business",
             fixed_scale=0.1,
@@ -40,7 +47,7 @@ def main():
         ),
     )
     jobs = []
-    for size in ["small", "medium", "large"]:
+    for size in args.scales:
         cfg = spec["conditions"][size + "-rho0.75"] | {"reward_mode": "business", "cycles": 128}
         path = output / (size + ".json")
         freeze_spec(path, cfg)
@@ -73,11 +80,7 @@ def main():
                 "256",
                 "--local-context",
                 "--load-mix",
-                "0.25",
-                "0.5",
-                "0.75",
-                "1",
-                "1.25",
+                *[str(load) for load in args.loads],
                 "--device",
                 "cuda",
                 "--wandb-mode",
@@ -102,8 +105,8 @@ def main():
                 cmd,
                 env=dict(
                     os.environ,
-                    ECSAI_RUN_NAME="MAPPO-context-" + name + "-seed0",
-                    BC_EVAL_LOCK=str(output / "evaluation.lock"),
+                    ECSAI_RUN_NAME="MAPPO-context-" + name + "-seed0" + args.run_tag,
+                    BC_EVAL_LOCK=str(args.evaluation_lock or output / "evaluation.lock"),
                     OMP_NUM_THREADS="1",
                     MKL_NUM_THREADS="1",
                 ),
@@ -118,7 +121,7 @@ def main():
                 raise RuntimeError(f"{name} exited {code}; checkpoint retained")
         return name
 
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=2 * len(args.scales)) as pool:
         for name in pool.map(run, jobs):
             print("COMPLETE", name, flush=True)
 
