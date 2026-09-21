@@ -475,7 +475,7 @@ class RunLog(Callback):
                 self.evaluate_contextual()
                 self.checkpoint("last.pt")
                 return
-            result = evaluate(
+            result = self.evaluate_legacy(
                 self.scenario,
                 self.method,
                 exp.policy,
@@ -496,7 +496,7 @@ class RunLog(Callback):
                 self.best = score
                 self.checkpoint("best.pt")
             if self.eval_stochastic:
-                sampled = evaluate(
+                sampled = self.evaluate_legacy(
                     self.scenario,
                     self.method,
                     exp.policy,
@@ -521,6 +521,12 @@ class RunLog(Callback):
                     self.best_stochastic = sampled_score
                     self.checkpoint("best-stochastic.pt")
         self.checkpoint("last.pt")
+
+    def evaluate_legacy(self, *args, **kwargs):
+        from .multiscale_bc import evaluation_slot
+
+        with evaluation_slot():
+            return evaluate(*args, **kwargs)
 
     def evaluate_contextual(self, advance_iteration=True):
         from .multiscale_bc import evaluation_slot
@@ -779,8 +785,9 @@ def train(
             restore_rng_states(payload)
             experiment.collector.update_policy_weights_()
         callback.checkpoint("last.pt", advance_iteration=False)
-        if local_context and not resume:
+        if not resume:
             callback.checkpoint("initial.pt", advance_iteration=False)
+        if local_context and not resume:
             callback.evaluate_contextual(advance_iteration=False)
             initial_payload = torch.load(
                 output / "initial.pt", map_location="cpu", weights_only=False

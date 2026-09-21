@@ -140,15 +140,21 @@ class ContextModel(Model):
             payload = torch.load(actor_init, map_location=self.device, weights_only=True)
             config = payload["config"]
             if (
-                config["format"] != "edge-bc-v1"
+                config["format"] not in {"edge-bc-v1", "edge-distill-independent-v1"}
                 or config["hidden_size"] != hidden_size
                 or config["input_dim"] != input_dim
                 or config["action_dim"] * 2 != self.output_leaf_spec.shape[-1]
                 or use_context
             ):
                 raise ValueError("base actor architecture mismatch")
-            for actor in self.actors:
-                actor.load_state_dict(payload["actor"], strict=True)
+            if config["format"] == "edge-distill-independent-v1":
+                if config["agents"] != self.n_agents or len(payload["actors"]) != self.n_agents:
+                    raise ValueError("independent distillation requires the original agent count")
+                for actor, state in zip(self.actors, payload["actors"], strict=True):
+                    actor.load_state_dict(state, strict=True)
+            else:
+                for actor in self.actors:
+                    actor.load_state_dict(payload["actor"], strict=True)
         if head_only:
             if use_context or input_dim != OBS:
                 raise ValueError("head-only adaptation requires a no-context actor")
