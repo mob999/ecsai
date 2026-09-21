@@ -78,3 +78,22 @@ versus the previous 12,800), and 64 for the regularized actor (19,200 updates,
 exactly matching its previous run). Do not compare epoch numbers as equal compute.
 W&B records updates and samples seen. Both runs evaluate the same 15 conditions
 only after training; no new data, objective changes or RL are involved.
+
+## Controlled objective/model search
+
+`search_bc_variants.py` runs eight seed-0 experiments: original and regularized
+actors, each with ordinary NLL, lower learning rate (1e-4), fixed latent action
+standard deviation 0.1 with NLL, and fixed standard deviation 0.1 with normalized
+mean-action MSE. Every run uses 20 complete epochs (6,000 updates). MSE is still
+imitation, not a claim of causal reward optimization. Compare fixed-MSE against
+fixed-NLL to isolate the loss change; compare lower-LR against ordinary NLL to
+isolate learning rate. Standard deviation is fixed in training and evaluation.
+
+Screen all 15 conditions with the first development seed, recomputing baseline
+means on that exact seed. Confirm the best two and the original NLL control on all
+four development seeds. Ranking minimizes the mean positive success-rate deficit
+in percentage points, then worst deficit, then mean successful-request latency
+ratio. The original strict gates are reported but no longer required by the user.
+A one-episode screening interval is not meaningful uncertainty evidence. Final
+confirmation reuses development data, not an independent generalization test.
+Do not alter or weaken baseline policies, retries, requests, or resource budgets.
