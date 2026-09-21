@@ -285,7 +285,8 @@ def test_collector_teacher_matches_baseline_execution(tmp_path, teacher):
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
-def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device):
+@pytest.mark.parametrize("regularized", [False, True])
+def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device, regularized):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires NVIDIA GPU")
     cfg = config()
@@ -313,14 +314,22 @@ def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device):
         raise RuntimeError("simulated evaluator interruption")
 
     args = (records, None, device, 32, 2, 2, 16, 1)
-    fit_phase(tmp_path / "reference", *args, ok)
+    options = (
+        dict(architecture=dict(depth=4, layer_norm=True, dropout=0.05), weight_decay=1e-4)
+        if regularized
+        else {}
+    )
+    fit_phase(tmp_path / "reference", *args, ok, **options)
     with pytest.raises(RuntimeError, match="simulated"):
-        fit_phase(tmp_path / "resumed", *args, interrupt)
+        fit_phase(tmp_path / "resumed", *args, interrupt, **options)
     assert torch.load(tmp_path / "resumed/last.pt", weights_only=True)["epoch"] == 1
-    fit_phase(tmp_path / "resumed", *args, ok)
+    fit_phase(tmp_path / "resumed", *args, ok, **options)
     a = torch.load(tmp_path / "reference/last.pt", weights_only=True)
     b = torch.load(tmp_path / "resumed/last.pt", weights_only=True)
     assert all(torch.equal(a["actor"][key], b["actor"][key]) for key in a["actor"])
+    policy = policy_from_payload(b)
+    assert all(not m.training for m in policy.modules() if isinstance(m, torch.nn.Dropout))
+    assert all(torch.isfinite(v).all() for v in b["actor"].values())
 
 
 def test_parallel_conditions_match_serial(tmp_path):

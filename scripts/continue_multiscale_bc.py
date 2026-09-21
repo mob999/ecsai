@@ -16,9 +16,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--eval-at-end-only", action="store_true")
+    parser.add_argument("--fresh-regularized", action="store_true")
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     args = parser.parse_args()
+    if args.fresh_regularized and args.resume_from:
+        parser.error("fresh training cannot resume a previous model")
     interval = args.epochs if args.eval_at_end_only else 20
     if args.workers < 1:
         parser.error("workers must be positive")
@@ -42,6 +45,7 @@ def main():
             interval=interval,
             seed_split="validation",
             no_new_data=True,
+            fresh_regularized=args.fresh_regularized,
         ),
     )
     if (output / "status.json").exists():
@@ -52,7 +56,7 @@ def main():
         shutil.copyfile(original, initial)
     if bc.sha256(initial) != bc.sha256(original):
         raise ValueError("initial snapshot changed")
-    if not (phase / "metrics.json").exists():
+    if not args.fresh_regularized and not (phase / "metrics.json").exists():
         shutil.copyfile(previous_phase / "metrics.json", phase / "metrics.json")
     source_spec = json.loads((source / "spec.json").read_text())
     conditions = {
@@ -68,19 +72,20 @@ def main():
         for n in conditions
     }
     selection_path = output / "selection.json"
-    if not selection_path.exists():
+    if not selection_path.exists() and not args.fresh_regularized:
         shutil.copyfile(previous / "selection.json", selection_path)
-    selected = json.loads(selection_path.read_text())
     best = output / "best.pt"
-    if not best.exists() or bc.sha256(best) != selected["checkpoint_sha256"]:
-        shutil.copyfile(selected["checkpoint"], best)
+    if selection_path.exists():
+        selected = json.loads(selection_path.read_text())
+        if not best.exists() or bc.sha256(best) != selected["checkpoint_sha256"]:
+            shutil.copyfile(selected["checkpoint"], best)
 
     def assess(checkpoint, tag):
         report = bc.compare_conditions(
             output, conditions, checkpoint, baselines, "validation", 4, tag
         )
-        old = json.loads(selection_path.read_text())
-        if tuple(report["rank"]) < tuple(old["rank"]):
+        old = json.loads(selection_path.read_text()) if selection_path.exists() else None
+        if old is None or tuple(report["rank"]) < tuple(old["rank"]):
             temporary = best.with_suffix(".tmp")
             shutil.copyfile(checkpoint, temporary)
             temporary.replace(best)
@@ -98,7 +103,7 @@ def main():
     bc.fit_phase(
         phase,
         records,
-        initial,
+        None if args.fresh_regularized else initial,
         args.device,
         cfg["hidden_size"],
         args.epochs,
@@ -106,7 +111,11 @@ def main():
         cfg["batch_size"],
         interval,
         assess,
-        continue_initial=True,
+        continue_initial=not args.fresh_regularized,
+        architecture=dict(depth=4, layer_norm=True, dropout=0.05)
+        if args.fresh_regularized
+        else None,
+        weight_decay=1e-4 if args.fresh_regularized else 0.0,
     )
     selected = json.loads(selection_path.read_text())
     bc.export_status(

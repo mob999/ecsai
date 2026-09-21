@@ -72,15 +72,17 @@ def seeds(split, condition_index, count, round_index=0):
 class ContextActor(nn.Module):
     """A 21-feature actor; deliberately separate from HistoryActor's DD mask."""
 
-    def __init__(self, hidden_size=256):
+    def __init__(self, hidden_size=256, depth=2, layer_norm=False, dropout=0.0):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(CONTEXT_DIM, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 10),
-        )
+        layers = []
+        for i in range(depth):
+            layers.append(nn.Linear(CONTEXT_DIM if i == 0 else hidden_size, hidden_size))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_size))
+            layers.append(nn.ReLU())
+            if dropout:
+                layers.append(nn.Dropout(dropout))
+        self.mlp = nn.Sequential(*layers, nn.Linear(hidden_size, 10))
         raw = math.log(math.expm1(0.3 - 0.01)) - math.log(math.expm1(0.99))
         with torch.no_grad():
             self.mlp[-1].weight[5:].zero_()
@@ -93,6 +95,10 @@ class ContextActor(nn.Module):
         return torch.cat((3 * torch.tanh(loc / 3), scale.clamp(-3, 1)), -1)
 
 
+def actor_from_config(config):
+    return ContextActor(config["hidden_size"], **config.get("architecture", {}))
+
+
 def policy_from_payload(payload):
     config = payload["config"]
     if (
@@ -102,7 +108,8 @@ def policy_from_payload(payload):
         or config["action_dim"] != 5
     ):
         raise ValueError("incompatible v2 actor contract")
-    actor = ContextActor(config["hidden_size"])
+    actor = actor_from_config(config)
+    actor.eval()
     actor.load_state_dict(payload["actor"])
     module = TensorDictSequential(
         TensorDictModule(actor, in_keys=[("agents", "observation")], out_keys=[("agents", "raw")]),
@@ -294,7 +301,7 @@ def _collect_one(job):
     actor = None
     if behavior:
         payload = torch.load(behavior, map_location="cpu", weights_only=True)
-        actor = ContextActor(payload["config"]["hidden_size"])
+        actor = actor_from_config(payload["config"])
         actor.load_state_dict(payload["actor"])
         actor.eval()
     columns = {
@@ -484,6 +491,8 @@ def fit_phase(
     interval,
     evaluate_checkpoint,
     continue_initial=False,
+    architecture=None,
+    weight_decay=0.0,
 ):
     import wandb
 
@@ -503,11 +512,18 @@ def fit_phase(
         data=[r["sha256"] for r in records],
         initial_sha256=sha256(initial) if initial else None,
     )
+    if architecture is not None:
+        config["architecture"] = architecture
+        config["weight_decay"] = weight_decay
     if continue_initial:
         if initial is None:
             raise ValueError("continuation requires an initial checkpoint")
         config["continue_initial"] = True
         original = torch.load(initial, map_location="cpu", weights_only=True)
+        if original["config"].get("architecture") != config.get("architecture"):
+            raise ValueError("continuation changed architecture")
+        if original["config"].get("weight_decay", 0.0) != weight_decay:
+            raise ValueError("continuation changed weight_decay")
         for key in (
             "format",
             "input_dim",
@@ -533,8 +549,12 @@ def fit_phase(
     if train.names != validation.names:
         raise ValueError("missing validation condition")
     torch.manual_seed(0)
-    actor = ContextActor(hidden).to(device)
-    optimizer = torch.optim.Adam(actor.parameters(), lr=3e-4)
+    actor = actor_from_config(config).to(device)
+    optimizer = (
+        torch.optim.AdamW(actor.parameters(), lr=3e-4, weight_decay=weight_decay)
+        if architecture is not None
+        else torch.optim.Adam(actor.parameters(), lr=3e-4)
+    )
     generator = torch.Generator().manual_seed(0)
     start = 0
     last = folder / "last.pt"
