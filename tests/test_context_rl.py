@@ -73,6 +73,7 @@ def test_context_pretrained_vs_scratch_update_and_resume(tmp_path, reward_mode):
         hidden_size=256,
         local_context=True,
         load_mix=(0.25, 1.25),
+        normalize_advantage=True,
     )
     for arm in ["pretrained", "scratch"]:
         train(
