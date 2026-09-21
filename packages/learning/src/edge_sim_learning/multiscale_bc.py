@@ -6,6 +6,7 @@ import gzip
 import json
 import math
 import multiprocessing
+import os
 import shutil
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -584,11 +585,13 @@ def fit_phase(
         return
     run = wandb.init(
         project="ecsai-deppo",
-        name=f"multiscale-bc-{folder.name}",
-        mode="offline",
+        name=os.environ.get("WANDB_NAME", f"multiscale-bc-{folder.name}"),
+        mode=os.environ.get("WANDB_MODE", "offline"),
         dir=str(folder),
         config=config,
     )
+    run.define_metric("epoch")
+    run.define_metric("*", step_metric="epoch")
     started = perf_counter()
 
     def checkpoint(epoch):
@@ -798,7 +801,7 @@ def export_status(output, status, report, reason):
     with wandb.init(
         project="ecsai-deppo",
         name="multiscale-bc-verdict",
-        mode="offline",
+        mode=os.environ.get("WANDB_MODE", "offline"),
         dir=str(output),
         config={"status": status, "reason": reason},
     ) as run:
