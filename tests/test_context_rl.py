@@ -44,7 +44,8 @@ def test_context_load_cycle_and_state(loads):
         env.close()
 
 
-def test_context_pretrained_vs_scratch_update_and_resume(tmp_path):
+@pytest.mark.parametrize("reward_mode", ["business", "logical"])
+def test_context_pretrained_vs_scratch_update_and_resume(tmp_path, reward_mode):
     torch.manual_seed(12)
     actor = ContextActor(256, 4, True, 0.05, 0.1)
     config = dict(
@@ -58,7 +59,9 @@ def test_context_pretrained_vs_scratch_update_and_resume(tmp_path):
     )
     base = tmp_path / "base.pt"
     torch.save(dict(config=config, actor=actor.state_dict()), base)
-    cfg = ScenarioConfig.profile("smoke").model_copy(update={"cycles": 4, "max_retries": 2})
+    cfg = ScenarioConfig.profile("smoke").model_copy(
+        update={"cycles": 4, "max_retries": 2, "reward_mode": reward_mode}
+    )
     opts = dict(
         method="MAPPO-no-context",
         workers=1,

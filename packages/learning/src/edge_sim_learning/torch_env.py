@@ -86,6 +86,8 @@ class ContentBatchEnv(EnvBase):
         )
         if local_context:
             self.metric_keys.append("delivery_load")
+        if config.reward_mode == "logical":
+            self.metric_keys.append("logical_reward")
         observation = prototype.observation_spec.clone()
         observation["metrics"] = Composite({k: Unbounded(shape=(1,)) for k in self.metric_keys})
         self.observation_spec = observation.expand(workers)

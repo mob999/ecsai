@@ -21,6 +21,7 @@ def main():
     p.add_argument("--loads", nargs="+", type=float, default=[0.25, 0.5, 0.75, 1, 1.25])
     p.add_argument("--run-tag", default="")
     p.add_argument("--evaluation-lock", type=Path)
+    p.add_argument("--reward", choices=["business", "paper", "logical"], default="business")
     args = p.parse_args()
     if any(load <= 0 for load in args.loads) or len(set(args.scales)) != len(args.scales):
         p.error("loads must be positive and scales must be unique")
@@ -39,7 +40,7 @@ def main():
             workers_per_run=2,
             training_concurrency=2 * len(args.scales),
             evaluation_concurrency=1,
-            reward="business",
+            reward=args.reward,
             fixed_scale=0.1,
             actor="independent 4x256 LayerNorm, dropout disabled in both arms",
             critic="shared 2x256",
@@ -48,7 +49,7 @@ def main():
     )
     jobs = []
     for size in args.scales:
-        cfg = spec["conditions"][size + "-rho0.75"] | {"reward_mode": "business", "cycles": 128}
+        cfg = spec["conditions"][size + "-rho0.75"] | {"reward_mode": args.reward, "cycles": 128}
         path = output / (size + ".json")
         freeze_spec(path, cfg)
         for arm in ["pretrained", "scratch"]:

@@ -24,6 +24,8 @@ class SchedulingEnv(ParallelEnv):
         self, config=None, seed=0, runner=None, slot=0, evaluation=False, method="DEPPO-adapted"
     ):
         self.config = config or ScenarioConfig()
+        if self.config.reward_mode == "logical" and not self.config.max_retries:
+            raise ValueError("logical reward requires retry outcome telemetry (max_retries > 0)")
         self.method = method
         self.direct = method == "DD-adapted"
         if self.direct and self.config.scheduler_release != "window":
@@ -107,6 +109,13 @@ class SchedulingEnv(ParallelEnv):
         self.last_view = self.session.inspect()
         self.latencies = []
         self.attempt_outcomes = {}
+        self.logical_settled = set()
+        self.logical_completed = self.logical_failed = 0
+        self.logical_elapsed_s = 0.0
+        self.logical_return = 0.0
+        self.logical_normalizer = max(
+            1, self.config.expected_arrivals(0, self.config.horizon_s) / self.config.cycles
+        )
         self.episode_return = 0
         self.response = None
         self.response_received = None
@@ -289,7 +298,14 @@ class SchedulingEnv(ParallelEnv):
             if self.config.episode_loads
             else self.config.request_rate * self.config.period_s,
         )
-        reward = paper_reward if self.config.reward_mode == "paper" else business_reward
+        logical_reward = (
+            self._settle_logical_reward(response.view.attempt_outcomes)
+            if self.config.reward_mode == "logical"
+            else 0.0
+        )
+        reward = {"paper": paper_reward, "business": business_reward, "logical": logical_reward}[
+            self.config.reward_mode
+        ]
         reward *= self.config.reward_scale
         self.episode_return += reward
         done = self.cycle >= self.config.cycles
@@ -305,6 +321,8 @@ class SchedulingEnv(ParallelEnv):
             "window_completed": response.completed,
             "window_resolved": resolved,
         }
+        if self.config.reward_mode == "logical":
+            self.last_metrics["logical_reward"] = logical_reward
         observations = self._observations()
         self.last_metrics["encoding_wall_s"] = perf_counter() - encoding_started
         rewards = dict.fromkeys(self.agents, reward)
@@ -314,6 +332,32 @@ class SchedulingEnv(ParallelEnv):
         if done:
             self.agents = []
         return observations, rewards, terminated, truncated, infos
+
+    def _settle_logical_reward(self, outcomes):
+        """Settle each original once, including all failed attempts and retry waits."""
+        numerator = 0.0
+        for outcome in outcomes:
+            succeeded = outcome.status == "SUCCEEDED"
+            exhausted = (
+                outcome.status in {"TIMED_OUT", "REJECTED"}
+                and outcome.attempt_index == self.config.max_retries
+            )
+            if not (succeeded or exhausted):
+                continue
+            original = outcome.original_request_id
+            if original in self.logical_settled:
+                continue
+            elapsed = outcome.completed_s - outcome.first_arrival_s
+            if not np.isfinite(elapsed) or elapsed < 0:
+                raise ValueError("invalid logical request elapsed time")
+            self.logical_settled.add(original)
+            self.logical_completed += int(succeeded)
+            self.logical_failed += int(not succeeded)
+            self.logical_elapsed_s += elapsed
+            numerator += (1 if succeeded else -1) - 0.1 * elapsed / self.config.deadline_s
+        reward = numerator / self.logical_normalizer
+        self.logical_return += reward
+        return reward
 
     def drain(self, action_fn=None, policy="threshold"):
         """Drain without learner steps; batch policies decide newly visible requests."""
@@ -343,6 +387,9 @@ class SchedulingEnv(ParallelEnv):
             )
             self.last_view = response.view
             self.attempt_outcomes.update({r.request_id: r for r in response.view.attempt_outcomes})
+            if self.config.reward_mode == "logical":
+                # Report the full ledger separately; drain adds no PPO transitions.
+                self._settle_logical_reward(response.view.attempt_outcomes)
             self._encode(response.view)
             self.elapsed = response.view.now_s
             self.latencies.extend(response.view.latencies_s)
@@ -444,6 +491,13 @@ class SchedulingEnv(ParallelEnv):
             metrics[kind + "_waiting"] = sum(p.waiting for p in pools)
             metrics[kind + "_active"] = sum(p.active for p in pools)
         metrics["scheduler_waiting"] = sum(len(s.waiting) for s in v.schedulers)
+        if self.config.reward_mode == "logical":
+            metrics.update(
+                logical_settled_completed=self.logical_completed,
+                logical_settled_failed=self.logical_failed,
+                logical_settled_elapsed_s=self.logical_elapsed_s,
+                logical_settled_return=self.logical_return,
+            )
         return metrics
 
     def close(self):
