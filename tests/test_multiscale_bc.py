@@ -81,11 +81,14 @@ def test_teachers_are_five_dimensional_and_state_local():
         env.close()
 
 
-def test_finite_v2_distribution_and_gradient():
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_finite_v2_distribution_and_gradient(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires NVIDIA GPU")
     torch.manual_seed(0)
-    actor = ContextActor(32)
-    obs = torch.randn(128, CONTEXT_DIM)
-    labels = torch.tensor([0, 0, 0, 2, 0.5]).repeat(128, 1)
+    actor = ContextActor(32).to(device)
+    obs = torch.randn(128, CONTEXT_DIM, device=device)
+    labels = torch.tensor([0, 0, 0, 2, 0.5], device=device).repeat(128, 1)
     opt = torch.optim.Adam(actor.parameters(), lr=0.003)
     initial = -distribution(actor, obs)[0].log_prob(labels).mean().item()
     for _ in range(30):
@@ -95,7 +98,7 @@ def test_finite_v2_distribution_and_gradient():
         assert all(torch.isfinite(p.grad).all() for p in actor.parameters())
         opt.step()
     assert loss.item() < initial
-    bounds = torch.tensor([[-5, -5, -5, -5, 0.05], [5, 5, 5, 5, 0.95]])
+    bounds = torch.tensor([[-5, -5, -5, -5, 0.05], [5, 5, 5, 5, 0.95]], device=device)
     assert torch.isfinite(distribution(actor, obs[:2])[0].log_prob(safe_actions(bounds))).all()
     with pytest.raises(ValueError, match="21"):
         actor(torch.zeros(2, 13))
@@ -227,7 +230,10 @@ def test_collector_teacher_matches_baseline_execution(tmp_path, teacher):
         assert collected["metrics"][key] == pytest.approx(result["mean"][key])
 
 
-def test_interrupted_evaluation_resumes_exact_training_state(tmp_path):
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires NVIDIA GPU")
     cfg = config()
     records = collect_jobs(
         tmp_path,
@@ -252,7 +258,7 @@ def test_interrupted_evaluation_resumes_exact_training_state(tmp_path):
     def interrupt(path, tag):
         raise RuntimeError("simulated evaluator interruption")
 
-    args = (records, None, "cpu", 32, 2, 2, 16, 1)
+    args = (records, None, device, 32, 2, 2, 16, 1)
     fit_phase(tmp_path / "reference", *args, ok)
     with pytest.raises(RuntimeError, match="simulated"):
         fit_phase(tmp_path / "resumed", *args, interrupt)
