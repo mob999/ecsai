@@ -287,8 +287,9 @@ def test_collector_teacher_matches_baseline_execution(tmp_path, teacher):
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("regularized", [False, True])
 @pytest.mark.parametrize("full_epoch", [False, True])
+@pytest.mark.parametrize("objective", ["nll", "fixed-nll", "mean-mse"])
 def test_interrupted_evaluation_resumes_exact_training_state(
-    tmp_path, device, regularized, full_epoch
+    tmp_path, device, regularized, full_epoch, objective
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires NVIDIA GPU")
@@ -323,6 +324,8 @@ def test_interrupted_evaluation_resumes_exact_training_state(
         else {}
     )
     options["full_epoch"] = full_epoch
+    if objective != "nll":
+        options.update(fixed_scale=0.1, loss_kind="nll" if objective == "fixed-nll" else objective)
     fit_phase(tmp_path / "reference", *args, ok, **options)
     with pytest.raises(RuntimeError, match="simulated"):
         fit_phase(tmp_path / "resumed", *args, interrupt, **options)
@@ -334,6 +337,14 @@ def test_interrupted_evaluation_resumes_exact_training_state(
     policy = policy_from_payload(b)
     assert all(not m.training for m in policy.modules() if isinstance(m, torch.nn.Dropout))
     assert all(torch.isfinite(v).all() for v in b["actor"].values())
+    if objective != "nll":
+        from edge_sim_learning.multiscale_bc import actor_from_config
+
+        actor = actor_from_config(b["config"])
+        actor.load_state_dict(b["actor"])
+        actor.eval()
+        _, _, scale = distribution(actor, torch.zeros(3, 21))
+        assert torch.allclose(scale, torch.full_like(scale, 0.1), atol=1e-6)
     if full_epoch:
         import json
         import math

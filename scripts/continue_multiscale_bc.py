@@ -19,6 +19,10 @@ def main():
     parser.add_argument("--fresh-regularized", action="store_true")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--full-epoch", action="store_true")
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--loss", choices=["nll", "mean-mse"], default="nll")
+    parser.add_argument("--fixed-scale", type=float)
+    parser.add_argument("--eval-episodes", type=int, default=4)
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     args = parser.parse_args()
@@ -28,6 +32,8 @@ def main():
     interval = args.epochs if args.eval_at_end_only else 20
     if args.workers < 1:
         parser.error("workers must be positive")
+    if not 1 <= args.eval_episodes <= 4:
+        parser.error("eval-episodes must be 1..4 to reuse the paired baseline episodes")
     torch.set_num_threads(1)
     bc.EVAL_WORKERS = args.workers
     source, output = args.source.resolve(), args.output.resolve()
@@ -51,6 +57,10 @@ def main():
             fresh_regularized=args.fresh_regularized,
             fresh=fresh,
             full_epoch=args.full_epoch,
+            learning_rate=args.learning_rate,
+            loss=args.loss,
+            fixed_scale=args.fixed_scale,
+            eval_episodes=args.eval_episodes,
         ),
     )
     if (output / "status.json").exists():
@@ -76,6 +86,16 @@ def main():
         }
         for n in conditions
     }
+    for i, name in enumerate(conditions):
+        selected_seeds = set(bc.seeds("validation", i, args.eval_episodes))
+        for report in baselines[name].values():
+            report["episodes"] = [e for e in report["episodes"] if e["seed"] in selected_seeds]
+            if len(report["episodes"]) != args.eval_episodes:
+                raise ValueError("missing paired baseline episode")
+            report["mean"] = {
+                k: sum(e[k] for e in report["episodes"]) / args.eval_episodes
+                for k in report["mean"]
+            }
     selection_path = output / "selection.json"
     if not selection_path.exists() and not fresh:
         shutil.copyfile(previous / "selection.json", selection_path)
@@ -87,7 +107,7 @@ def main():
 
     def assess(checkpoint, tag):
         report = bc.compare_conditions(
-            output, conditions, checkpoint, baselines, "validation", 4, tag
+            output, conditions, checkpoint, baselines, "validation", args.eval_episodes, tag
         )
         old = json.loads(selection_path.read_text()) if selection_path.exists() else None
         if old is None or tuple(report["rank"]) < tuple(old["rank"]):
@@ -118,6 +138,9 @@ def main():
         assess,
         continue_initial=not fresh,
         full_epoch=args.full_epoch,
+        learning_rate=args.learning_rate,
+        loss_kind=args.loss,
+        fixed_scale=args.fixed_scale,
         architecture=dict(depth=4, layer_norm=True, dropout=0.05)
         if args.fresh_regularized
         else None,
@@ -137,7 +160,7 @@ def main():
 
     rows = json.loads((phase / "metrics.json").read_text())
     fig, ax = plt.subplots(figsize=(9, 4))
-    for key in ["train_nll", "validation_nll"]:
+    for key in ["train_nll" if args.loss == "nll" else "train_mean_mse", "validation_nll"]:
         ax.plot([r["epoch"] for r in rows], [r[key] for r in rows], label=key)
     ax.set(xlabel="Epoch", ylabel="Action NLL", title="BC continuation on fixed offline data")
     ax.legend()

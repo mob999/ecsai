@@ -73,8 +73,9 @@ def seeds(split, condition_index, count, round_index=0):
 class ContextActor(nn.Module):
     """A 21-feature actor; deliberately separate from HistoryActor's DD mask."""
 
-    def __init__(self, hidden_size=256, depth=2, layer_norm=False, dropout=0.0):
+    def __init__(self, hidden_size=256, depth=2, layer_norm=False, dropout=0.0, fixed_scale=None):
         super().__init__()
+        self.fixed_scale = fixed_scale
         layers = []
         for i in range(depth):
             layers.append(nn.Linear(CONTEXT_DIM if i == 0 else hidden_size, hidden_size))
@@ -93,11 +94,18 @@ class ContextActor(nn.Module):
         if observation.shape[-1] != CONTEXT_DIM:
             raise ValueError("local-context-v2 requires exactly 21 features")
         loc, scale = self.mlp(observation).chunk(2, -1)
+        if self.fixed_scale is not None:
+            raw = math.log(math.expm1(self.fixed_scale - 0.01)) - math.log(math.expm1(0.99))
+            scale = torch.full_like(scale, raw)
         return torch.cat((3 * torch.tanh(loc / 3), scale.clamp(-3, 1)), -1)
 
 
 def actor_from_config(config):
-    return ContextActor(config["hidden_size"], **config.get("architecture", {}))
+    return ContextActor(
+        config["hidden_size"],
+        **config.get("architecture", {}),
+        fixed_scale=config.get("fixed_scale"),
+    )
 
 
 def policy_from_payload(payload):
@@ -511,6 +519,9 @@ def fit_phase(
     architecture=None,
     weight_decay=0.0,
     full_epoch=False,
+    learning_rate=3e-4,
+    loss_kind="nll",
+    fixed_scale=None,
 ):
     import wandb
 
@@ -522,7 +533,7 @@ def fit_phase(
         context_names=list(CONTEXT_NAMES),
         action_dim=5,
         hidden_size=hidden,
-        learning_rate=3e-4,
+        learning_rate=learning_rate,
         batch_size=batch_size,
         batches=batches,
         epochs=epochs,
@@ -535,11 +546,24 @@ def fit_phase(
         config["weight_decay"] = weight_decay
     if full_epoch:
         config["sampling"] = "full-shuffle-condition-weighted"
+    if loss_kind not in ("nll", "mean-mse"):
+        raise ValueError("unknown loss")
+    if loss_kind != "nll":
+        if fixed_scale is None:
+            raise ValueError("mean-mse requires fixed action scale")
+        config["loss_kind"] = loss_kind
+    if fixed_scale is not None:
+        if not 0.1 <= fixed_scale <= 0.3:
+            raise ValueError("fixed_scale must be between 0.1 and 0.3")
+        config["fixed_scale"] = fixed_scale
     if continue_initial:
         if initial is None:
             raise ValueError("continuation requires an initial checkpoint")
         config["continue_initial"] = True
         original = torch.load(initial, map_location="cpu", weights_only=True)
+        for key in ("fixed_scale", "loss_kind"):
+            if original["config"].get(key) != config.get(key):
+                raise ValueError(f"continuation changed {key}")
         if original["config"].get("sampling") != config.get("sampling"):
             raise ValueError("continuation changed sampling")
         if original["config"].get("architecture") != config.get("architecture"):
@@ -575,9 +599,9 @@ def fit_phase(
     torch.manual_seed(0)
     actor = actor_from_config(config).to(device)
     optimizer = (
-        torch.optim.AdamW(actor.parameters(), lr=3e-4, weight_decay=weight_decay)
+        torch.optim.AdamW(actor.parameters(), lr=learning_rate, weight_decay=weight_decay)
         if architecture is not None
-        else torch.optim.Adam(actor.parameters(), lr=3e-4)
+        else torch.optim.Adam(actor.parameters(), lr=learning_rate)
     )
     generator = torch.Generator().manual_seed(0)
     start = 0
@@ -645,7 +669,14 @@ def fit_phase(
                     weights = 1.0
                 target = safe_actions(labels)
                 label_errors.append((labels - target).abs().max().item())
-                loss = (-distribution(actor, obs)[0].log_prob(target) * weights).mean()
+                dist, loc, _ = distribution(actor, obs)
+                if loss_kind == "nll":
+                    per_sample = -dist.log_prob(target)
+                else:
+                    center = target.new_tensor([0, 0, 0, 0, 0.5])
+                    radius = target.new_tensor([5, 5, 5, 5, 0.45])
+                    per_sample = (torch.tanh(loc) - (target - center) / radius).square().mean(-1)
+                loss = (per_sample * weights).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("non-finite NLL; last.pt retains previous full epoch")
                 optimizer.zero_grad()
@@ -673,6 +704,8 @@ def fit_phase(
                 row["samples_this_epoch"] = sum(sizes)
                 row["samples_seen"] = epoch * sum(sizes)
                 row["updates_per_epoch"] = steps_per_epoch
+            if loss_kind != "nll":
+                row["train_mean_mse"] = row.pop("train_nll")
             if not all(math.isfinite(v) for v in row.values()):
                 raise FloatingPointError("non-finite training diagnostics")
             if epoch % interval == 0:
