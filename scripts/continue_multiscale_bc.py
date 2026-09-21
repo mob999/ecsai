@@ -12,11 +12,14 @@ from edge_sim_learning import multiscale_bc as bc
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--resume-from", type=Path, help="Previous continuation output directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--eval-at-end-only", action="store_true")
     parser.add_argument("--workers", type=int, default=12)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     args = parser.parse_args()
+    interval = args.epochs if args.eval_at_end_only else 20
     if args.workers < 1:
         parser.error("workers must be positive")
     torch.set_num_threads(1)
@@ -25,7 +28,9 @@ def main():
     phase = output / "continued"
     phase.mkdir(parents=True, exist_ok=True)
     records = json.loads((source / "round-0/data/manifest.json").read_text())
-    original = source / "round-0/last.pt"
+    previous = args.resume_from.resolve() if args.resume_from else source
+    previous_phase = previous / "continued" if args.resume_from else source / "round-0"
+    original = previous_phase / "last.pt"
     cfg = torch.load(original, map_location="cpu", weights_only=True)["config"]
     bc.freeze_spec(
         output / "spec.json",
@@ -34,7 +39,7 @@ def main():
             initial_sha256=bc.sha256(original),
             data=[r["sha256"] for r in records],
             epochs=args.epochs,
-            interval=20,
+            interval=interval,
             seed_split="validation",
             no_new_data=True,
         ),
@@ -48,7 +53,7 @@ def main():
     if bc.sha256(initial) != bc.sha256(original):
         raise ValueError("initial snapshot changed")
     if not (phase / "metrics.json").exists():
-        shutil.copyfile(source / "round-0/metrics.json", phase / "metrics.json")
+        shutil.copyfile(previous_phase / "metrics.json", phase / "metrics.json")
     source_spec = json.loads((source / "spec.json").read_text())
     conditions = {
         n: bc.ScenarioConfig.model_validate(c) for n, c in source_spec["conditions"].items()
@@ -64,7 +69,7 @@ def main():
     }
     selection_path = output / "selection.json"
     if not selection_path.exists():
-        shutil.copyfile(source / "selection.json", selection_path)
+        shutil.copyfile(previous / "selection.json", selection_path)
     selected = json.loads(selection_path.read_text())
     best = output / "best.pt"
     if not best.exists() or bc.sha256(best) != selected["checkpoint_sha256"]:
@@ -99,7 +104,7 @@ def main():
         args.epochs,
         cfg["batches"],
         cfg["batch_size"],
-        20,
+        interval,
         assess,
         continue_initial=True,
     )
