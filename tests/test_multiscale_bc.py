@@ -267,3 +267,30 @@ def test_interrupted_evaluation_resumes_exact_training_state(tmp_path, device):
     a = torch.load(tmp_path / "reference/last.pt", weights_only=True)
     b = torch.load(tmp_path / "resumed/last.pt", weights_only=True)
     assert all(torch.equal(a["actor"][key], b["actor"][key]) for key in a["actor"])
+
+
+def test_parallel_conditions_match_serial(tmp_path):
+    import edge_sim_learning.multiscale_bc as bc
+
+    cfg = config()
+    old = bc.EVAL_WORKERS
+    try:
+        bc.EVAL_WORKERS = 8
+        parallel = bc.evaluation_batch(
+            [
+                (tmp_path / f"parallel-{i}", cfg.model_dump(), [101, 102], method, None, None)
+                for i, method in enumerate(["local", "forward"])
+            ]
+        )
+        bc.EVAL_WORKERS = 1
+        serial = bc.evaluation_batch(
+            [
+                (tmp_path / f"serial-{i}", cfg.model_dump(), [101, 102], method, None, None)
+                for i, method in enumerate(["local", "forward"])
+            ]
+        )
+        for a, b in zip(parallel, serial, strict=True):
+            for key in ["logical_success_rate", "mean_success_e2e_s", "mean_failed_elapsed_s"]:
+                assert a["mean"][key] == pytest.approx(b["mean"][key])
+    finally:
+        bc.EVAL_WORKERS = old

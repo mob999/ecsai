@@ -211,6 +211,29 @@ def cached_evaluate(folder, cfg, seed_list, method="local", ratio=None, checkpoi
 EVAL_WORKERS = 1
 
 
+def _evaluation_job(job):
+    global EVAL_WORKERS
+    folder, config, seed_list, method, ratio, checkpoint, workers = job
+    EVAL_WORKERS = workers
+    return cached_evaluate(
+        folder, ScenarioConfig.model_validate(config), seed_list, method, ratio, checkpoint
+    )
+
+
+def evaluation_batch(jobs):
+    """Bound total simulation workers; independent condition controllers use spawn."""
+    budget = EVAL_WORKERS
+    parallel = min(len(jobs), max(1, budget // 4))
+    inner = max(1, budget // parallel)
+    tasks = [(*job, inner) for job in jobs]
+    if parallel == 1:
+        return [_evaluation_job(job) for job in tasks]
+    with ProcessPoolExecutor(
+        max_workers=parallel, mp_context=multiprocessing.get_context("spawn")
+    ) as pool:
+        return list(pool.map(_evaluation_job, tasks))
+
+
 def reference_report(reports):
     # Stable ID tie-break, then success, then latency (never select on student output).
     name = min(
@@ -660,14 +683,20 @@ def make_conditions(source_root, smoke=False):
 
 def compare_conditions(output, conditions, checkpoint, baseline_reports, seed_split, count, tag):
     rows, reports = [], {}
-    for i, (name, cfg) in enumerate(conditions.items()):
-        result = cached_evaluate(
-            output / "evaluations" / tag / name,
-            cfg,
-            seeds(seed_split, i, count),
-            method="MAPPO-no-context",
-            checkpoint=checkpoint,
-        )
+    results = evaluation_batch(
+        [
+            (
+                output / "evaluations" / tag / name,
+                cfg.model_dump(),
+                seeds(seed_split, i, count),
+                "MAPPO-no-context",
+                None,
+                checkpoint,
+            )
+            for i, (name, cfg) in enumerate(conditions.items())
+        ]
+    )
+    for name, result in zip(conditions, results, strict=True):
         ref_name, ref = reference_report(baseline_reports[name])
         rows.append(
             dict(
@@ -811,38 +840,51 @@ def run_suite(source_root, output, workers=4, device="cpu", smoke=False):
     write_json(output / "metadata.json", metadata(next(iter(conditions.values())), 0, "BC-v2"))
     selection_count, val_count = (1, 1) if smoke else (4, 4)
     baseline_reports, chosen, teacher_checks = {}, {}, {}
-    # Baselines/teacher selection are cached independently so failures do not lose experiments.
-    for i, (name, cfg) in enumerate(conditions.items()):
-        candidates = {}
-        for teacher in TEACHERS:
-            method, ratio = teacher_method(teacher)
-            candidates[teacher] = cached_evaluate(
-                output / "teacher-selection" / name / teacher,
-                cfg,
-                seeds("selection", i, selection_count),
-                method,
-                ratio,
-            )
-        teacher, _ = reference_report(candidates)
-        chosen[name] = teacher
-        freeze_spec(output / "teacher-selection" / name / "selected.json", {"teacher": teacher})
-        baseline_reports[name] = {}
-        for label, (method, ratio) in BASELINES.items():
-            baseline_reports[name][label] = cached_evaluate(
-                output / "baselines-validation" / name / label,
-                cfg,
-                seeds("validation", i, val_count),
-                method,
-                ratio,
-            )
-        method, ratio = teacher_method(teacher)
-        selected_report = cached_evaluate(
-            output / "teacher-validation" / name,
-            cfg,
+    # Independent conditions share a bounded pool of simulation workers.
+    teacher_jobs = [
+        (
+            output / "teacher-selection" / name / teacher,
+            cfg.model_dump(),
+            seeds("selection", i, selection_count),
+            *teacher_method(teacher),
+            None,
+        )
+        for i, (name, cfg) in enumerate(conditions.items())
+        for teacher in TEACHERS
+    ]
+    teacher_results = iter(evaluation_batch(teacher_jobs))
+    for name in conditions:
+        candidates = {teacher: next(teacher_results) for teacher in TEACHERS}
+        chosen[name], _ = reference_report(candidates)
+        freeze_spec(
+            output / "teacher-selection" / name / "selected.json", {"teacher": chosen[name]}
+        )
+    baseline_jobs = [
+        (
+            output / "baselines-validation" / name / label,
+            cfg.model_dump(),
             seeds("validation", i, val_count),
             method,
             ratio,
+            None,
         )
+        for i, (name, cfg) in enumerate(conditions.items())
+        for label, (method, ratio) in BASELINES.items()
+    ]
+    baseline_results = iter(evaluation_batch(baseline_jobs))
+    for name in conditions:
+        baseline_reports[name] = {label: next(baseline_results) for label in BASELINES}
+    chosen_jobs = [
+        (
+            output / "teacher-validation" / name,
+            cfg.model_dump(),
+            seeds("validation", i, val_count),
+            *teacher_method(chosen[name]),
+            None,
+        )
+        for i, (name, cfg) in enumerate(conditions.items())
+    ]
+    for name, selected_report in zip(conditions, evaluation_batch(chosen_jobs), strict=True):
         _, reference = reference_report(baseline_reports[name])
         teacher_checks[name] = gate(selected_report, reference)
     write_json(output / "teacher-checks.json", teacher_checks)
@@ -946,17 +988,22 @@ def run_suite(source_root, output, workers=4, device="cpu", smoke=False):
     # Only now open the held-out test split; selected weights cannot change on resume.
     freeze_spec(output / "test-selection.json", {"checkpoint_sha256": sha256(best_path)})
     test_count = 2 if smoke else 30
-    test_baselines = {}
-    for i, (name, cfg) in enumerate(conditions.items()):
-        test_baselines[name] = {}
-        for label, (method, ratio) in BASELINES.items():
-            test_baselines[name][label] = cached_evaluate(
-                output / "baselines-test" / name / label,
-                cfg,
-                seeds("test", i, test_count),
-                method,
-                ratio,
-            )
+    test_jobs = [
+        (
+            output / "baselines-test" / name / label,
+            cfg.model_dump(),
+            seeds("test", i, test_count),
+            method,
+            ratio,
+            None,
+        )
+        for i, (name, cfg) in enumerate(conditions.items())
+        for label, (method, ratio) in BASELINES.items()
+    ]
+    test_results = iter(evaluation_batch(test_jobs))
+    test_baselines = {
+        name: {label: next(test_results) for label in BASELINES} for name in conditions
+    }
     final = compare_conditions(
         output, conditions, best_path, test_baselines, "test", test_count, "final-test"
     )
