@@ -504,3 +504,35 @@ def test_fast_batch_path_matches_pettingzoo_across_partial_reset(method):
         batch.close()
         for wrapper in wrappers:
             wrapper.close()
+
+
+def test_retry_evaluation_reconciles_original_requests_and_attempts():
+    from edge_sim_learning.experiment import evaluate
+
+    config = ScenarioConfig.profile("smoke").model_copy(
+        update={
+            "max_retries": 2,
+            "retry_delay_s": 0.1,
+            "scheduler_release": "window",
+            "delivery_load": 1.5,
+        }
+    )
+    result = evaluate(config, method="random", seeds=[1000000000])
+    episode = result["episodes"][0]
+    records = episode["retry_outcomes"]
+    assert episode["retry_attempts"] > 0
+    assert episode["logical_requests"] == len(records)
+    assert episode["logical_requests"] == episode["logical_completed"] + episode["logical_failed"]
+    assert episode["arrived"] == sum(r["attempts"] for r in records)
+    assert episode["mean_resolution_time_s"] == pytest.approx(
+        sum(r["total_elapsed_s"] for r in records) / len(records)
+    )
+    for r in records:
+        attempts = r["attempt_outcomes"]
+        assert 1 <= len(attempts) <= 3
+        assert r["total_elapsed_s"] == pytest.approx(r["attempt_time_s"] + r["retry_wait_s"])
+        assert all(a["origin_cluster"] == attempts[0]["origin_cluster"] for a in attempts)
+        for earlier, later in zip(attempts, attempts[1:], strict=False):
+            assert later["arrival_s"] == pytest.approx(earlier["completed_s"] + 0.1)
+            assert later["deadline_s"] - later["arrival_s"] == pytest.approx(1)
+    assert episode["unfinished"] == episode["logical_unfinished"] == 0

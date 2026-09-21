@@ -149,36 +149,40 @@ def _evaluate_serial(
                 inference_calls += 1
                 return dict(zip(env.possible_agents, action, strict=True))
 
+            def rule_actions(_, env=env, rng=rng):
+                action = np.tile(
+                    [0, 0, 0, -5 if method == "local" else 5, 0.5], (config.clusters, 1)
+                ).astype(np.float32)
+                if method == "random" and fixed_ratio is None:
+                    action[:, 4] = rng.uniform(0.4, 0.6, config.clusters)
+                if method == "queue-adaptive":
+                    # Same per-request Bernoulli forwarding as Random, only allocation differs.
+                    for i, agent in enumerate(env.possible_agents):
+                        pools = [
+                            p for p in env.last_view.pools if env.cache_clusters[p.node_id] == agent
+                        ]
+                        back = sum(p.remaining_bytes for p in pools if p.kind == "backhaul")
+                        total = sum(p.remaining_bytes for p in pools)
+                        action[i, 4] = np.clip(back / total, 0.05, 0.95) if total else 0.5
+                if fixed_ratio is not None:
+                    action[:, 4] = fixed_ratio
+                return dict(zip(env.possible_agents, action, strict=True))
+
             while env.agents:
-                if policy is not None:
-                    action = np.stack(list(infer(obs).values()))
-                else:
-                    action = np.tile(
-                        [0, 0, 0, -5 if method == "local" else 5, 0.5], (config.clusters, 1)
-                    ).astype(np.float32)
-                    if method == "random" and fixed_ratio is None:
-                        action[:, 4] = rng.uniform(0.4, 0.6, config.clusters)
-                    if method == "queue-adaptive":
-                        # Same per-request Bernoulli forwarding as Random, only allocation differs.
-                        for i, agent in enumerate(env.possible_agents):
-                            pools = [
-                                p
-                                for p in env.last_view.pools
-                                if env.cache_clusters[p.node_id] == agent
-                            ]
-                            back = sum(p.remaining_bytes for p in pools if p.kind == "backhaul")
-                            total = sum(p.remaining_bytes for p in pools)
-                            action[i, 4] = np.clip(back / total, 0.05, 0.95) if total else 0.5
-                    if fixed_ratio is not None:
-                        action[:, 4] = fixed_ratio
-                actions = dict(zip(env.possible_agents, action, strict=True))
+                actions = infer(obs) if policy is not None else rule_actions(obs)
                 if method in {"random", "queue-adaptive"} and policy is None:
                     env.begin(actions, policy="random")
                 obs, _, _, _, _ = env.step(actions)
             truncated_metrics = env.metrics()
-            metrics = env.drain(infer if policy is not None else None)
+            metrics = env.drain(
+                infer if policy is not None else rule_actions if config.max_retries else None,
+                policy="random"
+                if policy is None and method in {"random", "queue-adaptive"}
+                else "threshold",
+            )
             episodes.append(
                 metrics
+                | ({"retry_outcomes": env.retry_records()} if config.max_retries else {})
                 | {
                     "seed": seed,
                     "workload": env.workload,
@@ -200,7 +204,7 @@ def _evaluation_report(method, exploration, fixed_ratio, seeds, episodes):
     means = {
         key: float(np.mean([row[key] for row in episodes]))
         for key in episodes[0]
-        if key not in {"seed", "workload"}
+        if key not in {"seed", "workload", "retry_outcomes"}
     }
     return {
         "method": method,

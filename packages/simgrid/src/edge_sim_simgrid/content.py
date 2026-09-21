@@ -47,6 +47,8 @@ class Request:
     forwarded: bool = False
     finished: float | None = None
     reason: str | None = None
+    original_id: str | None = None
+    attempt_index: int = 0
 
 
 @dataclass
@@ -70,6 +72,9 @@ class ContentRuntime:
         self.requests = {r.id: Request(r, r.cluster_id) for r in self.spec.requests}
         self.arrivals = sorted(self.spec.requests, key=lambda r: (r.arrival_s, r.id))
         self.arrival_index = 0
+        self.retry_arrivals = []
+        self.retry_sequence = 0
+        self.originals = {r.id: r for r in self.spec.requests}
         self.deadlines = []
         self.live = set()
         self.changed = set()
@@ -410,6 +415,37 @@ class ContentRuntime:
             if not t.waiters:
                 self._remove_transfer(t, cancelled=True)
         self.emit("request_finished", rid, status=status, reason=reason)
+        if status != "SUCCEEDED" and r.attempt_index < self.spec.max_retries:
+            original_id = r.original_id or rid
+            original = self.originals[original_id]
+            self.retry_sequence += 1
+            retry_id = f"__retry_{self.retry_sequence}"
+            while retry_id in self.requests:
+                self.retry_sequence += 1
+                retry_id = f"__retry_{self.retry_sequence}"
+            arrival = self.now + self.spec.retry_delay_s
+            attempt = original.model_copy(
+                update={
+                    "id": retry_id,
+                    "arrival_s": arrival,
+                    "deadline_s": arrival + original.deadline_s - original.arrival_s,
+                }
+            )
+            self.requests[retry_id] = Request(
+                attempt,
+                original.cluster_id,
+                original_id=original_id,
+                attempt_index=r.attempt_index + 1,
+            )
+            heapq.heappush(self.retry_arrivals, (arrival, self.retry_sequence, retry_id))
+            self.emit(
+                "retry_scheduled",
+                retry_id,
+                original_request_id=original_id,
+                previous_request_id=rid,
+                arrival_s=arrival,
+                attempt_index=r.attempt_index + 1,
+            )
 
     def _account_bytes(self, t):
         # Progress remains entirely native. Sampling at a boundary or just before
@@ -477,6 +513,19 @@ class ContentRuntime:
                     self._finish(spec.id, "TIMED_OUT", "deadline")
                 else:
                     self._enqueue(spec.id, spec.cluster_id)
+            # Original arrivals precede retries at an exact tie. Boundary arrivals
+            # (including retries) are deferred when arrivals=False.
+            while self.retry_arrivals and self.retry_arrivals[0][0] <= self.now:
+                _, _, rid = heapq.heappop(self.retry_arrivals)
+                spec = self.requests[rid].spec
+                self.counts["arrived"] += 1
+                self.live.add(rid)
+                heapq.heappush(self.deadlines, (spec.deadline_s, rid))
+                self.emit("request_arrived", rid)
+                if spec.deadline_s <= self.now:
+                    self._finish(rid, "TIMED_OUT", "deadline")
+                else:
+                    self._enqueue(rid, spec.cluster_id)
         for cluster, queue in self.queues.items():
             if queue and cluster not in self.busy and self._eligible(queue[0]):
                 rid = queue.popleft()
@@ -556,13 +605,17 @@ class ContentRuntime:
             dates = [until_s] + [t for _, t in self.busy.values()]
             if self.arrival_index < len(self.arrivals):
                 dates.append(self.arrivals[self.arrival_index].arrival_s)
+            if self.retry_arrivals:
+                dates.append(self.retry_arrivals[0][0])
             while self.deadlines and self.deadlines[0][1] not in self.live:
                 heapq.heappop(self.deadlines)
             if self.deadlines:
                 dates.append(self.deadlines[0][0])
             self._wait(min(t for t in dates if t > self.now))
         self._settle(arrivals=False)
-        finished = self.arrival_index == len(self.arrivals) and not self.live
+        finished = (
+            self.arrival_index == len(self.arrivals) and not self.live and not self.retry_arrivals
+        )
         return WindowResult(
             kind="finished" if finished else "time",
             start_s=start,
@@ -622,6 +675,9 @@ class ContentRuntime:
             requests=tuple(
                 ContentRequestState(
                     request_id=rid,
+                    original_request_id=r.original_id or rid,
+                    attempt_index=r.attempt_index,
+                    first_arrival_s=self.originals[r.original_id or rid].arrival_s,
                     origin_cluster=r.spec.cluster_id,
                     cluster_id=r.cluster,
                     artifact_id=r.spec.artifact_id,
@@ -683,10 +739,34 @@ class ContentRuntime:
                 for r in sorted(self.changed)
                 if self.requests[r].status == "SUCCEEDED"
             ),
+            attempt_outcomes=tuple(
+                ContentRequestState(
+                    request_id=rid,
+                    original_request_id=r.original_id or rid,
+                    attempt_index=r.attempt_index,
+                    first_arrival_s=self.originals[r.original_id or rid].arrival_s,
+                    origin_cluster=r.spec.cluster_id,
+                    cluster_id=r.cluster,
+                    artifact_id=r.spec.artifact_id,
+                    size_bytes=self.artifacts[r.spec.artifact_id].size_bytes,
+                    arrival_s=r.spec.arrival_s,
+                    deadline_s=r.spec.deadline_s,
+                    completed_s=r.finished,
+                    status=r.status,
+                    reason=r.reason,
+                    cache_node=r.cache,
+                    forwarded=r.forwarded,
+                )
+                for rid in sorted(self.changed)
+                for r in (self.requests[rid],)
+                if self.spec.max_retries and r.status in TERMINAL
+            ),
         )
 
     def result(self):
-        done = self.arrival_index == len(self.arrivals) and not self.live
+        done = (
+            self.arrival_index == len(self.arrivals) and not self.live and not self.retry_arrivals
+        )
         return RunResult(
             run_id=self.run.run_id,
             seed=self.run.seed,

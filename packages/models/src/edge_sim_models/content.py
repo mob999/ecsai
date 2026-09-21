@@ -45,6 +45,8 @@ class ContentRequest(DTO):
 
 class ContentServiceSpec(DTO):
     origin: Identifier
+    max_retries: Count = 0
+    retry_delay_s: Seconds = 0.1
     bandwidth_mode: Literal["independent", "shared"] = "independent"
     coalesce_backhaul: bool = True
     scheduler_release: Literal["continuous", "window"] = "continuous"
@@ -132,6 +134,9 @@ class SchedulerState(DTO):
 
 class ContentRequestState(DTO):
     request_id: Identifier
+    original_request_id: Identifier | None = None
+    attempt_index: Count = 0
+    first_arrival_s: Seconds | None = None
     origin_cluster: Identifier
     cluster_id: Identifier
     artifact_id: Identifier
@@ -185,6 +190,8 @@ class ContentView(DTO):
     overflows: Count = 0
     cancelled_transfers: Count = 0
     latencies_s: tuple[Seconds, ...] = ()
+    # Retry-enabled runs expose completed attempts, including failures, per window.
+    attempt_outcomes: tuple[ContentRequestState, ...] = ()
 
 
 class WindowResult(DTO):

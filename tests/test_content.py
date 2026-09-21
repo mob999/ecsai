@@ -327,3 +327,87 @@ def test_unmerged_duplicate_fetches_and_cancellation_share_storage_safely():
         assert (final.view.completed, final.view.timed_out, final.view.rejected) == (2, 1, 0)
         backhaul = next(x for x in final.view.links if x.link_id == "b0")
         assert backhaul.bytes_sent == pytest.approx(249.9)
+
+
+def test_retry_timeout_then_cached_delivery_and_total_elapsed():
+    run = scenario([("r0", "a", 0, 0, 1.5)])
+    run = run.model_copy(
+        update={
+            "content": run.content.model_copy(
+                update={
+                    "max_retries": 2,
+                    "retry_delay_s": 0.1,
+                }
+            )
+        }
+    )
+    with start(run) as session:
+        first = session.advance_window(1.5, control(run), scope="scheduling")
+        assert first.kind != "finished"
+        assert first.view.timed_out == 1
+        assert first.view.attempt_outcomes[0].completed_s == pytest.approx(1.5)
+        boundary = session.advance_window(1.6, control(run), scope="scheduling")
+        assert boundary.view.arrived == 1  # retry at boundary belongs to next control
+        out = session.advance_window(5, control(run), scope="scheduling")
+        assert out.kind == "finished"
+        assert out.view.arrived == 2 and out.view.completed == 1
+        assert out.view.cache_hits == 1
+        retry = out.view.attempt_outcomes[0]
+        assert retry.original_request_id == "r0" and retry.attempt_index == 1
+        assert retry.arrival_s == pytest.approx(1.6)
+        assert retry.completed_s == pytest.approx(2.601)
+        assert retry.completed_s - retry.first_arrival_s == pytest.approx(1.5 + 0.1 + 1.001)
+        links = {x.link_id: x.bytes_sent for x in out.view.links}
+        assert links["b0"] == pytest.approx(100)
+        assert links["d0"] == pytest.approx(149.9)  # cancelled partial + repeated full delivery
+
+
+def test_retry_exhaustion_cancels_transfers_and_counts_all_attempts():
+    run = scenario([("r0", "a", 0, 0, 0.25)])
+    run = run.model_copy(
+        update={
+            "content": run.content.model_copy(
+                update={
+                    "max_retries": 2,
+                    "retry_delay_s": 0.1,
+                }
+            )
+        }
+    )
+    with start(run) as session:
+        out = session.advance_window(2, control(run), scope="scheduling")
+        assert out.kind == "finished"
+        assert (out.view.arrived, out.view.completed, out.view.timed_out) == (3, 0, 3)
+        assert out.view.cancelled_transfers == 3
+        records = sorted(out.view.attempt_outcomes, key=lambda r: r.attempt_index)
+        assert [r.arrival_s for r in records] == pytest.approx([0, 0.35, 0.7])
+        assert records[-1].completed_s == pytest.approx(0.95)
+        assert not out.view.transfers
+
+
+def test_retry_overflow_uses_original_cluster_and_bounded_backoff():
+    run = scenario([("r0", "a", 0, 0, 1), ("r1", "a", 0, 0, 1)], scheduler_waiting=0)
+    run = run.model_copy(
+        update={
+            "content": run.content.model_copy(
+                update={
+                    "max_retries": 2,
+                    "retry_delay_s": 0.1,
+                    "schedulers": tuple(
+                        s.model_copy(update={"service_s": 10}) for s in run.content.schedulers
+                    ),
+                }
+            )
+        }
+    )
+    with start(run) as session:
+        out = session.advance_window(4, control(run), scope="scheduling")
+        assert out.kind == "finished"
+        assert out.view.rejected == 3
+        records = sorted(
+            (r for r in out.view.attempt_outcomes if r.original_request_id == "r1"),
+            key=lambda r: r.attempt_index,
+        )
+        assert [r.arrival_s for r in records] == pytest.approx([0, 0.1, 0.2])
+        assert all(r.origin_cluster == "s0" for r in records)
+        assert records[-1].completed_s == pytest.approx(0.2)

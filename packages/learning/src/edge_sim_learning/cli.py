@@ -55,6 +55,8 @@ def main():
     p.add_argument("--fixed-ratio", type=float)
     p.add_argument("--split", choices=["validation", "test"], default="validation")
     p.add_argument("--checkpoint", type=Path)
+    p.add_argument("--max-retries", type=int, default=0)
+    p.add_argument("--retry-delay-s", type=float, default=0.1)
     p.add_argument("--episodes", type=int, default=10)
     p.add_argument("--workers", type=int, default=1, help="Parallel evaluation episodes")
     p = sub.choices["benchmark"]
@@ -119,6 +121,13 @@ def main():
                 payload["method"],
             )
         base_seed = 1_000_000_000 if args.split == "validation" else 2_000_000_000
+        config = ScenarioConfig.model_validate(
+            config.model_dump()
+            | {
+                "max_retries": args.max_retries,
+                "retry_delay_s": args.retry_delay_s,
+            }
+        )
         result = evaluate(
             config,
             method,

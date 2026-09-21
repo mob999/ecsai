@@ -53,6 +53,8 @@ class ScenarioConfig(BaseModel):
     transfer_concurrency: int = Field(default=1, ge=1)
     scheduler_capacity: int = Field(default=100, ge=0)
     scheduler_service_s: float = Field(default=0.001, gt=0)
+    max_retries: int = Field(default=0, ge=0)
+    retry_delay_s: float = Field(default=0.1, ge=0)
 
     @classmethod
     def profile(cls, name):
@@ -205,6 +207,8 @@ def build_run(config: ScenarioConfig, seed: int, run_id="content", trace=False):
         ),
         content=ContentServiceSpec(
             origin="origin",
+            max_retries=config.max_retries,
+            retry_delay_s=config.retry_delay_s,
             scheduler_release=config.scheduler_release,
             bandwidth_mode=config.bandwidth_mode,
             coalesce_backhaul=config.coalesce_backhaul,

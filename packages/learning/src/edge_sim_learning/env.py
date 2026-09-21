@@ -106,6 +106,7 @@ class SchedulingEnv(ParallelEnv):
         self.current = {a: np.zeros(OBS, np.float32) for a in self.agents}
         self.last_view = self.session.inspect()
         self.latencies = []
+        self.attempt_outcomes = {}
         self.episode_return = 0
         self.response = None
         self.response_received = None
@@ -266,6 +267,7 @@ class SchedulingEnv(ParallelEnv):
             self.history[a].append(np.concatenate((self.current[a], self.pending_actions[a])))
         self.cycle += 1
         self.last_view = response.view
+        self.attempt_outcomes.update({r.request_id: r for r in response.view.attempt_outcomes})
         self._encode(response.view)
         self.latencies.extend(response.view.latencies_s)
         self.elapsed = response.view.now_s
@@ -308,9 +310,13 @@ class SchedulingEnv(ParallelEnv):
             self.agents = []
         return observations, rewards, terminated, truncated, infos
 
-    def drain(self, action_fn=None):
+    def drain(self, action_fn=None, policy="threshold"):
         """Drain without learner steps; batch policies decide newly visible requests."""
-        limit = self.config.horizon_s + self.config.deadline_s
+        limit = (
+            self.config.horizon_s
+            + (self.config.max_retries + 1) * self.config.deadline_s
+            + self.config.max_retries * self.config.retry_delay_s
+        )
         while self.elapsed < limit:
             if self.direct and action_fn is None:
                 raise ValueError("DD drain requires policy inference for newly visible requests")
@@ -319,7 +325,7 @@ class SchedulingEnv(ParallelEnv):
                 live_agents, self.agents = self.agents, self.possible_agents.copy()
                 try:
                     actions = action_fn(self._observations())
-                    self.pending_control = self.control(actions)
+                    self.pending_control = self.control(actions, policy=policy)
                     if not self.direct:
                         for a in self.possible_agents:
                             self.history[a].append(np.concatenate((self.current[a], actions[a])))
@@ -331,12 +337,74 @@ class SchedulingEnv(ParallelEnv):
                 scope="scheduling",
             )
             self.last_view = response.view
+            self.attempt_outcomes.update({r.request_id: r for r in response.view.attempt_outcomes})
             self._encode(response.view)
             self.elapsed = response.view.now_s
             self.latencies.extend(response.view.latencies_s)
             if response.kind == "finished":
                 break
-        return self.metrics()
+        metrics = self.metrics()
+        if self.config.max_retries:
+            metrics.update(self.retry_metrics())
+        return metrics
+
+    def retry_records(self):
+        groups = {}
+        for attempt in self.attempt_outcomes.values():
+            groups.setdefault(attempt.original_request_id, []).append(attempt)
+        records = []
+        for original in self.run.content.requests:
+            attempts = sorted(groups.get(original.id, []), key=lambda r: r.attempt_index)
+            if not attempts:
+                raise ValueError("missing request outcome after retry drain")
+            last = attempts[-1]
+            if last.status != "SUCCEEDED" and last.attempt_index != self.config.max_retries:
+                raise ValueError("retry drain ended before all attempts resolved")
+            if [a.attempt_index for a in attempts] != list(range(len(attempts))):
+                raise ValueError("missing attempt in retry trajectory")
+            total = last.completed_s - original.arrival_s
+            service = sum(a.completed_s - a.arrival_s for a in attempts)
+            wait = self.config.retry_delay_s * (len(attempts) - 1)
+            if not np.isclose(total, service + wait, atol=1e-7, rtol=1e-7):
+                raise ValueError("retry end-to-end duration does not reconcile")
+            records.append(
+                {
+                    "request_id": original.id,
+                    "status": last.status,
+                    "attempts": len(attempts),
+                    "total_elapsed_s": total,
+                    "attempt_time_s": service,
+                    "retry_wait_s": wait,
+                    "attempt_outcomes": [a.model_dump() for a in attempts],
+                }
+            )
+        return records
+
+    def retry_metrics(self):
+        records = self.retry_records()
+        succeeded = [r for r in records if r["status"] == "SUCCEEDED"]
+        failed = [r for r in records if r["status"] != "SUCCEEDED"]
+
+        def average(rows):
+            return float(np.mean([r["total_elapsed_s"] for r in rows])) if rows else 0.0
+
+        return {
+            "logical_requests": len(records),
+            "logical_completed": len(succeeded),
+            "logical_failed": len(failed),
+            "logical_unfinished": 0,
+            "logical_success_rate": len(succeeded) / max(1, len(records)),
+            # Failure is terminal observation, not successful delivery.
+            "mean_resolution_time_s": average(records),
+            "mean_success_e2e_s": average(succeeded),
+            "mean_failed_elapsed_s": average(failed),
+            "retry_attempts": sum(r["attempts"] - 1 for r in records),
+            "mean_attempts": sum(r["attempts"] for r in records) / max(1, len(records)),
+            "total_elapsed_s": sum(r["total_elapsed_s"] for r in records),
+            "success_e2e_p95_s": float(np.percentile([r["total_elapsed_s"] for r in succeeded], 95))
+            if succeeded
+            else 0.0,
+        }
 
     def metrics(self):
         v = self.last_view
