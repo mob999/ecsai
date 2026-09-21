@@ -483,6 +483,7 @@ def fit_phase(
     batch_size,
     interval,
     evaluate_checkpoint,
+    continue_initial=False,
 ):
     import wandb
 
@@ -502,6 +503,28 @@ def fit_phase(
         data=[r["sha256"] for r in records],
         initial_sha256=sha256(initial) if initial else None,
     )
+    if continue_initial:
+        if initial is None:
+            raise ValueError("continuation requires an initial checkpoint")
+        config["continue_initial"] = True
+        original = torch.load(initial, map_location="cpu", weights_only=True)
+        for key in (
+            "format",
+            "input_dim",
+            "hidden_size",
+            "action_dim",
+            "learning_rate",
+            "batch_size",
+            "batches",
+            "data",
+        ):
+            if original["config"][key] != config[key]:
+                raise ValueError(f"continuation changed {key}")
+        origin_epoch = original["epoch"]
+        if epochs <= origin_epoch:
+            raise ValueError("continuation must extend epoch budget")
+    else:
+        origin_epoch = 0
     freeze_spec(folder / "config.json", config)
     train, validation = (
         BalancedData(records, "train"),
@@ -521,8 +544,8 @@ def fit_phase(
         )
         actor.load_state_dict(state["actor"])
         optimizer.load_state_dict(state["optimizer"])
-        if last.exists():
-            if state["config"] != config:
+        if last.exists() or continue_initial:
+            if last.exists() and state["config"] != config:
                 raise ValueError("training resume contract changed")
             start = state["epoch"]
             generator.set_state(state["sample_rng"].cpu())
@@ -535,7 +558,8 @@ def fit_phase(
     previous_wall = metrics[-1]["wall_s"] if metrics else 0.0
     # Complete an interrupted scheduled evaluation before performing more updates.
     for epoch in range(interval, start + 1, interval):
-        evaluate_checkpoint(folder / f"epoch-{epoch}.pt", f"{folder.name}-epoch-{epoch}")
+        if epoch > origin_epoch:
+            evaluate_checkpoint(folder / f"epoch-{epoch}.pt", f"{folder.name}-epoch-{epoch}")
     if start == epochs:
         return
     run = wandb.init(
@@ -559,7 +583,7 @@ def fit_phase(
         )
 
     if not last.exists():
-        atomic_save(checkpoint(0), last)
+        atomic_save(checkpoint(start), last)
     try:
         for epoch in range(start + 1, epochs + 1):
             actor.train()

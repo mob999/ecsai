@@ -160,6 +160,60 @@ def test_real_collection_checkpoint_resume_and_dagger(tmp_path):
     before = (folder / "last.pt").read_bytes()
     fit_phase(folder, records, None, "cpu", 32, 2, 2, 16, 1, assess)
     assert (folder / "last.pt").read_bytes() == before
+    # Extending the budget must preserve the optimizer and sampling state.
+    fit_phase(tmp_path / "reference", records, None, "cpu", 32, 4, 2, 16, 2, assess)
+    calls.clear()
+    continued = tmp_path / "continued"
+    fit_phase(
+        continued,
+        records,
+        folder / "last.pt",
+        "cpu",
+        32,
+        4,
+        2,
+        16,
+        2,
+        assess,
+        continue_initial=True,
+    )
+    assert calls == ["continued-epoch-4"]
+    actual = torch.load(continued / "last.pt", weights_only=True)
+    expected = torch.load(tmp_path / "reference/last.pt", weights_only=True)
+    assert actual["epoch"] == 4
+    for key in expected["actor"]:
+        assert torch.equal(actual["actor"][key], expected["actor"][key])
+    assert torch.equal(actual["sample_rng"], expected["sample_rng"])
+    for key, state in expected["optimizer"]["state"].items():
+        for field, value in state.items():
+            assert torch.equal(actual["optimizer"]["state"][key][field], value)
+    fit_phase(
+        continued,
+        records,
+        folder / "last.pt",
+        "cpu",
+        32,
+        4,
+        2,
+        16,
+        2,
+        assess,
+        continue_initial=True,
+    )
+    with pytest.raises(ValueError, match="changed batch_size"):
+        fit_phase(
+            tmp_path / "invalid",
+            records,
+            folder / "last.pt",
+            "cpu",
+            32,
+            4,
+            2,
+            32,
+            2,
+            assess,
+            continue_initial=True,
+        )
     base = load_base_policy(folder / "last.pt")
     assert base.observation_profile == "local-context-v2"
     payload = torch.load(folder / "last.pt", weights_only=True)
